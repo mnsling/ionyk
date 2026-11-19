@@ -2,11 +2,17 @@ import 'cash_denominations_page.dart';
 import 'keyboard_pos.dart';
 import 'workspace_pages.dart';
 import 'admin_products_page.dart';
+import 'admin_workspaces.dart';
+import 'ionyk_brand.dart';
 import 'transactions_page.dart';
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 
-void main() => runApp(const IonykApp());
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await IonykBrand.instance.load();
+  runApp(const IonykApp());
+}
 
 class Palette {
   static const bg = Color(0xFFF3F4F1);
@@ -27,12 +33,14 @@ class Palette {
 class IonykApp extends StatelessWidget {
   const IonykApp({super.key});
   @override
-  Widget build(BuildContext context) => MaterialApp(
+  Widget build(BuildContext context) => AnimatedBuilder(
+    animation: IonykBrand.instance,
+    builder: (context, _) => MaterialApp(
         title: 'IONYK Systems',
         debugShowCheckedModeBanner: false,
         theme: ThemeData(
           scaffoldBackgroundColor: Palette.bg,
-          colorScheme: ColorScheme.fromSeed(seedColor: Palette.orange, surface: Palette.paper),
+          colorScheme: ColorScheme.fromSeed(seedColor: IonykBrand.instance.accent, surface: Palette.paper),
           textTheme: GoogleFonts.dmSansTextTheme().apply(bodyColor: Palette.ink, displayColor: Palette.ink),
           useMaterial3: true,
           dialogTheme: DialogThemeData(
@@ -56,7 +64,8 @@ class IonykApp extends StatelessWidget {
           )),
         ),
         home: const LoginPage(),
-      );
+      ),
+  );
 }
 
 enum UserRole { admin, cashier }
@@ -111,12 +120,9 @@ class _LoginPageState extends State<LoginPage> {
     constraints: const BoxConstraints(maxWidth: 430),
     child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, mainAxisSize: MainAxisSize.min, children: [
       Row(children: [
-        Container(width: 38, height: 38, decoration: BoxDecoration(color: Palette.dark, borderRadius: BorderRadius.circular(11)), child: const Icon(Icons.all_inclusive_rounded, color: Palette.orange, size: 23)),
+        const IonykBrandMark(size: 38),
         const SizedBox(width: 11),
-        const Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text('IONYK', style: TextStyle(fontSize: 17, fontWeight: FontWeight.w700, letterSpacing: -.5, height: 1.1)),
-          Text('SYSTEMS', style: TextStyle(fontSize: 9, fontWeight: FontWeight.w600, letterSpacing: 1.5, color: Palette.muted)),
-        ]),
+        const IonykBrandName(dark: false),
       ]),
       const SizedBox(height: 51),
       const Text('Made for the way\nyou work.', style: TextStyle(fontSize: 30, height: 1.25, fontWeight: FontWeight.w600, letterSpacing: -.9)),
@@ -236,12 +242,9 @@ class _DashboardShellState extends State<DashboardShell> {
         padding: const EdgeInsets.fromLTRB(16, 27, 16, 17),
         child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
           Padding(padding: const EdgeInsets.symmetric(horizontal: 10), child: Row(children: [
-            Container(width: 36, height: 36, decoration: BoxDecoration(color: const Color(0xFF303837), borderRadius: BorderRadius.circular(11)), child: const Icon(Icons.all_inclusive_rounded, color: Palette.orange, size: 24)),
+            const IonykBrandMark(size: 36),
             const SizedBox(width: 10),
-            const Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Text('IONYK', style: TextStyle(fontSize: 17, color: Colors.white, fontWeight: FontWeight.w700, letterSpacing: -.65, height: 1.1)),
-              Text('SYSTEMS', style: TextStyle(fontSize: 9, fontWeight: FontWeight.w500, letterSpacing: 1.8, color: Color(0xFFBEC0C4))),
-            ]),
+            const Expanded(child: IonykBrandName()),
           ])),
           const SizedBox(height: 46),
           const Padding(padding: EdgeInsets.only(left: 12, bottom: 13), child: Text('WORKSPACE', style: TextStyle(fontSize: 10, color: Color(0xFF979CA5), fontWeight: FontWeight.w600, letterSpacing: 1))),
@@ -264,10 +267,10 @@ class _DashboardShellState extends State<DashboardShell> {
       child: Container(height: 42, padding: const EdgeInsets.symmetric(horizontal: 12), decoration: BoxDecoration(
         color: active ? const Color(0xFF303A37) : Colors.transparent, borderRadius: BorderRadius.circular(11)),
         child: Row(children: [
-          Icon(icons[i], size: 17, color: active ? Palette.orange : const Color(0xFFB4C1BC)),
+          Icon(icons[i], size: 17, color: active ? IonykBrand.instance.accent : const Color(0xFFB4C1BC)),
           const SizedBox(width: 12),
-          Expanded(child: Text(pages[i], style: TextStyle(fontSize: 12.5, fontWeight: active ? FontWeight.w600 : FontWeight.w400, color: active ? Palette.lime : const Color(0xFFDAE4DD)))),
-          if (active) Container(width: 4, height: 4, decoration: const BoxDecoration(color: Palette.orange, shape: BoxShape.circle)),
+          Expanded(child: Text(pages[i], style: TextStyle(fontSize: 12.5, fontWeight: active ? FontWeight.w600 : FontWeight.w400, color: active ? IonykBrand.instance.accent : const Color(0xFFDAE4DD)))),
+          if (active) Container(width: 4, height: 4, decoration: BoxDecoration(color: IonykBrand.instance.accent, shape: BoxShape.circle)),
         ]),
       ),
     ));
@@ -393,9 +396,22 @@ class _DashboardShellState extends State<DashboardShell> {
     return WorkspacePages(title: pages[tab], admin: false);
   }
 
-  Widget _detailPage() => pages[tab] == 'Products' ? const AdminProductsPage() : WorkspacePages(title: pages[tab], admin: true);
+  Widget _detailPage() => pages[tab] == 'Products' ? const AdminProductsPage() : AdminWorkspacePage(title: pages[tab]);
 
-  Widget _button(String name, IconData icon, {bool dark = true, VoidCallback? onTap}) => OutlinedButton.icon(onPressed: onTap ?? () { ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$name is a preview action.'))); }, icon: Icon(icon, size: 16), label: Text(name), style: OutlinedButton.styleFrom(backgroundColor: dark ? Palette.dark : Palette.paper, foregroundColor: dark ? Colors.white : Palette.ink, side: BorderSide.none, shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)), padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 17), textStyle: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600)));
+  Widget _button(String name, IconData icon, {bool dark = true, VoidCallback? onTap}) =>
+      SizedBox(height: 40, child: OutlinedButton.icon(
+        onPressed: onTap ?? () { ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('$name is a preview action.'))); },
+        icon: Icon(icon, size: 16), label: Text(name),
+        style: OutlinedButton.styleFrom(
+          backgroundColor: dark ? Palette.dark : Colors.white,
+          foregroundColor: dark ? const Color(0xFFD9FF57) : Palette.ink,
+          side: dark ? BorderSide.none : const BorderSide(color: Color(0xFFE0E5DF)),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          textStyle: const TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600),
+        ),
+      ));
   Widget _chip(String label, IconData icon) => Container(padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8), decoration: BoxDecoration(color: Palette.bg, borderRadius: BorderRadius.circular(10)), child: Row(children: [Text(label, style: const TextStyle(fontSize: 10.5)), const SizedBox(width: 5), Icon(icon, size: 14)]));
 }
 
