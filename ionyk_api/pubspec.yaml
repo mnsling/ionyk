@@ -1,0 +1,10 @@
+name: ionyk_local_api
+description: IONYK local development API
+publish_to: none
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+dependencies:
+  shelf: ^1.4.2
+  shelf_router: ^1.1.5
+  postgres: ^3.6.0
+  crypto: ^3.0.3

@@ -1,4 +1,6 @@
+import 'dart:ui' show PointerDeviceKind;
 import 'package:flutter/material.dart';
+import 'ionyk_api.dart';
 
 /// IONYK Systems — Products + Price Management preview.
 /// All edits are kept in memory. There is no database or POS synchronization yet.
@@ -46,7 +48,8 @@ class _Product {
 }
 
 class _PendingProduct {
-  _PendingProduct(this.product, {required this.isNew, required this.description});
+  _PendingProduct(this.product, {required this.isNew, required this.description, this.draftId});
+  final int? draftId;
   _Product product;
   final bool isNew;
   String description;
@@ -65,13 +68,95 @@ class _AdminProductsPageState extends State<AdminProductsPage> {
   // Prototype staging area. None of these records is visible to the
   // published catalogue until Publish is pressed.
   final Map<String, _PendingProduct> pending = {};
-  final products = <_Product>[
-    _Product('4800012345678', 'Coca-Cola 1.5L', 'Beverages', 65, 78, 'Suysing', 124, previousPrice: 75),
-    _Product('4800098765432', 'Piattos Cheese 85g', 'Snacks', 23, 30, 'Supplier B', 42, previousPrice: 28),
-    _Product('4800024681357', 'Lucky Me Pancit Canton', 'Noodles', 15, 20, 'Suysing', 96, previousPrice: 20),
-    _Product('4800086420357', 'Nescafé Classic 50g', 'Coffee', 63, 80, 'Supplier C', 25, previousPrice: 76),
-    _Product('4800000111222', 'Nova BBQ', 'Snacks', 21, 27, 'Supplier B', 18, previousPrice: 26),
-  ];
+  final IonykApi api = const IonykApi();
+  final products = <_Product>[];
+  bool loading = true;
+  String? loadError;
+
+  @override
+  void initState() {
+    super.initState();
+    refreshFromDatabase();
+  }
+
+  double _asDouble(Object? v) => double.tryParse('$v') ?? 0;
+  int _asInt(Object? v) => int.tryParse('$v') ?? 0;
+  String _asString(Object? v) => v?.toString() ?? '';
+
+  _Product _draftProduct(Map<String, dynamic> data) {
+    final cost = _asDouble(data['supplier_cost_per_piece']);
+    final price = _asDouble(data['piece_price']);
+    final quantity = _asInt(data['pieces_per_case']);
+    final qty = quantity < 1 ? 1 : quantity;
+    return _Product(
+      _asString(data['piece_barcode']),
+      _asString(data['description']),
+      _asString(data['category']),
+      cost, price, _asString(data['supplier']), 0,
+      unitsPerCase: qty,
+      caseBarcode: _asString(data['case_barcode']),
+      sellingUnits: _asString(data['selling_units']).isEmpty ? 'piece' : _asString(data['selling_units']),
+      casePrice: data['case_price'] == null ? price * qty : _asDouble(data['case_price']),
+    );
+  }
+
+  Map<String, dynamic> _payload(_ProductFormResult form, String barcode) => {
+    'description': form.name,
+    'piece_barcode': barcode,
+    'supplier_cost_per_piece': form.pieceCost,
+    'piece_price': form.piecePrice,
+    'category': form.category,
+    'supplier': form.supplier,
+    'case_barcode': form.caseBarcode,
+    'case_price': form.casePrice,
+    'pieces_per_case': form.piecesPerCase,
+    'selling_units': form.sellingUnits,
+  };
+
+  Future<void> refreshFromDatabase() async {
+    if (mounted) setState(() { loading = true; loadError = null; });
+    try {
+      final results = await Future.wait([api.publishedProducts(), api.pendingDrafts()]);
+      final published = <_Product>[];
+      for (final row in results[0]) {
+        final unit = row['sell_case'] == true
+            ? (row['sell_piece'] == true ? 'both' : 'case') : 'piece';
+        final qty = _asInt(row['pieces_per_case']);
+        published.add(_Product(
+          _asString(row['piece_barcode']), _asString(row['description']),
+          _asString(row['category']), _asDouble(row['supplier_cost_per_piece']),
+          _asDouble(row['piece_price']), _asString(row['supplier']), 0,
+          unitsPerCase: qty < 1 ? 1 : qty,
+          caseBarcode: _asString(row['case_barcode']),
+          sellingUnits: unit,
+          casePrice: _asDouble(row['case_price']),
+        ));
+      }
+      final staged = <String, _PendingProduct>{};
+      for (final row in results[1]) {
+        final raw = row['proposed_data'];
+        if (raw is! Map) continue;
+        final data = Map<String, dynamic>.from(raw);
+        final product = _draftProduct(data);
+        if (product.barcode.isEmpty) continue;
+        staged[product.barcode] = _PendingProduct(product,
+          isNew: row['action'] == 'create',
+          description: row['action'] == 'create' ? 'New product' : 'Product update',
+          draftId: _asInt(row['id']),
+        );
+      }
+      if (!mounted) return;
+      setState(() {
+        products..clear()..addAll(published);
+        pending..clear()..addAll(staged);
+        loading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() { loading = false; loadError = e.toString(); });
+      message('Could not load products: $e');
+    }
+  }
 
   @override
   void dispose() { search.dispose(); tableHorizontalScroll.dispose(); super.dispose(); }
@@ -132,11 +217,12 @@ class _AdminProductsPageState extends State<AdminProductsPage> {
 
   Future<void> edit(_Product product) async {
     final staged = pending[product.barcode];
-    final original = staged?.product ?? product;
+    if (staged?.draftId == null || staged!.isNew == false) {
+      message('Editing published products requires the next secured API phase.');
+      return;
+    }
     final updated = await showDialog<_ProductFormResult>(
-      context: context,
-      builder: (_) => _ProductForm(product: original),
-    );
+      context: context, builder: (_) => _ProductForm(product: staged.product));
     if (!mounted || updated == null) return;
     if (updated.caseBarcode.isNotEmpty &&
         (updated.caseBarcode == product.barcode ||
@@ -144,22 +230,13 @@ class _AdminProductsPageState extends State<AdminProductsPage> {
       message('Case barcode must be unique and different from the piece barcode.');
       return;
     }
-    final isNew = staged?.isNew ?? !products.any((p) => p.barcode == product.barcode);
-    final published = products.where((p) => p.barcode == product.barcode);
-    final revised = _Product(
-      product.barcode, updated.name, updated.category,
-      updated.pieceCost, updated.piecePrice, updated.supplier, product.stock,
-      previousPrice: published.isNotEmpty ? published.first.price : null,
-      previousCasePrice: published.isNotEmpty && published.first.sellingUnits != 'piece'
-          ? published.first.casePrice : null,
-      unitsPerCase: updated.piecesPerCase,
-      caseBarcode: updated.caseBarcode,
-      sellingUnits: updated.sellingUnits,
-      caseCost: updated.caseCost, casePrice: updated.casePrice,
-    );
-    setState(() => pending[product.barcode] = _PendingProduct(revised,
-      isNew: isNew, description: isNew ? 'New product' : 'Product update'));
-    message('Changes staged. Publish when you are ready.');
+    try {
+      await api.updateProductDraft(staged.draftId!, _payload(updated, product.barcode));
+      await refreshFromDatabase();
+      if (mounted) message('Pending draft updated in PostgreSQL.');
+    } catch (e) {
+      if (mounted) message('Could not update draft: $e');
+    }
   }
 
   Future<void> addProduct() async {
@@ -169,134 +246,65 @@ class _AdminProductsPageState extends State<AdminProductsPage> {
     final barcode = updated.barcode.trim();
     if (barcodeTaken(barcode) ||
         (updated.caseBarcode.isNotEmpty &&
-          (updated.caseBarcode == barcode || barcodeTaken(updated.caseBarcode)))) {
+         (updated.caseBarcode == barcode || barcodeTaken(updated.caseBarcode)))) {
       message('Barcode is already assigned to a product or case.');
       return;
     }
-    setState(() => pending[barcode] = _PendingProduct(
-      _Product(barcode, updated.name, updated.category, updated.pieceCost,
-        updated.piecePrice, updated.supplier, 0,
-        unitsPerCase: updated.piecesPerCase,
-        caseBarcode: updated.caseBarcode,
-        sellingUnits: updated.sellingUnits,
-        caseCost: updated.caseCost, casePrice: updated.casePrice),
-      isNew: true, description: 'New product'));
-    message('Product added to Pending Changes (not yet published).');
+    try {
+      await api.createProductDraft(_payload(updated, barcode));
+      await refreshFromDatabase();
+      if (mounted) message('Product draft saved to PostgreSQL.');
+    } catch (e) {
+      if (mounted) message('Could not save draft: $e');
+    }
   }
 
   Future<void> publishPending() async {
-    if (pending.isEmpty) return;
-    final count = pending.length;
-    String selectedTarget = 'all';
-    const destinations = <String, String>{
-      'all': 'All counters (01, 02, 03)',
-      '01': 'Counter 01',
-      '02': 'Counter 02',
-      '03': 'Counter 03',
-    };
-
-    final target = await showDialog<String>(
-      context: context,
-      builder: (dialogContext) => StatefulBuilder(
-        builder: (dialogContext, setDialogState) => AlertDialog(
-          backgroundColor: Colors.white,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(18),
-          ),
-          title: const Text('Publish product changes',
-            style: TextStyle(fontSize: 19, fontWeight: FontWeight.w700)),
-          content: SizedBox(
-            width: 390,
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text('$count pending product change(s)',
-                  style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
-                const SizedBox(height: 15),
-                const Text('PUBLISH DESTINATION',
-                  style: TextStyle(fontSize: 10, color: muted, fontWeight: FontWeight.w700)),
-                const SizedBox(height: 8),
-                ...destinations.entries.map((entry) => Padding(
-                  padding: const EdgeInsets.only(bottom: 6),
-                  child: InkWell(
-                    borderRadius: BorderRadius.circular(10),
-                    onTap: () => setDialogState(() => selectedTarget = entry.key),
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 11),
-                      decoration: BoxDecoration(
-                        borderRadius: BorderRadius.circular(10),
-                        color: selectedTarget == entry.key ? const Color(0xFFF1F9D9) : soft,
-                        border: Border.all(
-                          color: selectedTarget == entry.key ? const Color(0xFFA5D637) : border,
-                        ),
-                      ),
-                      child: Row(children: [
-                        Icon(
-                          selectedTarget == entry.key
-                            ? Icons.radio_button_checked : Icons.radio_button_unchecked,
-                          size: 18,
-                          color: selectedTarget == entry.key ? ink : muted,
-                        ),
-                        const SizedBox(width: 10),
-                        Expanded(child: Text(entry.value,
-                          style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600))),
-                      ]),
-                    ),
-                  ),
-                )),
-                const SizedBox(height: 8),
-                Container(
-                  padding: const EdgeInsets.all(12),
-                  decoration: BoxDecoration(
-                    color: const Color(0xFFFFF8E8),
-                    borderRadius: BorderRadius.circular(10),
-                  ),
-                  child: const Text(
-                    'Demo only: The selected counter is a preview. '
-                    'This app currently updates its local catalogue only; '
-                    'no actual POS terminals receive these changes.',
-                    style: TextStyle(fontSize: 11, color: Color(0xFF68532D), height: 1.45),
-                  ),
-                ),
-              ],
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(dialogContext),
-              child: const Text('Cancel'),
-            ),
-            FilledButton(
-              style: FilledButton.styleFrom(
-                backgroundColor: ink, foregroundColor: lime,
-              ),
-              onPressed: () => Navigator.pop(dialogContext, selectedTarget),
-              child: const Text('Publish locally · Demo'),
-            ),
-          ],
-        ),
-      ),
-    );
-
-    if (target == null || !mounted) return;
-    setState(() {
-      for (final entry in pending.entries) {
-        final index = products.indexWhere((p) => p.barcode == entry.key);
-        if (index >= 0) {
-          products[index] = entry.value.product.copy();
-        } else {
-          products.add(entry.value.product.copy());
-        }
-      }
-      pending.clear();
-    });
-    message('$count change(s) published to LOCAL demo catalogue. '
-      'Chosen: ${destinations[target]}. No POS terminal sync occurred.');
+    final drafts=pending.values.where((p)=>p.draftId != null).toList();
+    if (drafts.isEmpty) { message('No pending drafts to publish'); return; }
+    try {
+      final counters=(await api.terminals()).where((r)=>r['is_active']==true).toList();
+      if (!mounted) return;
+      if (counters.isEmpty) { message('Add an active counter in Settings first'); return; }
+      final selected=<int>{for (final c in counters) c['id'] as int};
+      final approved=await showDialog<bool>(context:context,builder:(dialogContext)=>StatefulBuilder(
+        builder:(ctx,refresh)=>AlertDialog(
+          title:const Text('Publish to POS'),
+          content:SizedBox(width:400,child:Column(mainAxisSize:MainAxisSize.min,
+            crossAxisAlignment:CrossAxisAlignment.start,children:[
+            Text('Publish ${drafts.length} pending product(s) to:'),
+            const SizedBox(height:12),
+            ...counters.map((c)=>CheckboxListTile(
+              title:Text('${c['label']} · ${c['display_name']??''}'),
+              value:selected.contains(c['id']),
+              onChanged:(v)=>refresh(() {if (v==true) {selected.add(c['id'] as int);} else {selected.remove(c['id']);}}),
+              controlAffinity:ListTileControlAffinity.leading,
+              dense:true,
+            )),
+          ])),
+          actions:[TextButton(onPressed:()=>Navigator.pop(ctx,false),child:const Text('Cancel')),
+            FilledButton(onPressed:selected.isEmpty?null:()=>Navigator.pop(ctx,true),child:const Text('Publish'))],
+        )));
+      if (approved!=true || !mounted) return;
+      await api.publishDrafts(drafts.map((p)=>p.draftId!).toList(),selected.toList());
+      await refreshFromDatabase();
+      if (mounted) message('Products published to ${selected.length} counter(s). Sign in again to refresh POS.');
+    } catch (e) { if (mounted) message('Could not publish: $e'); }
   }
 
-  void discardPending(String barcode) {
-    setState(() => pending.remove(barcode));
+  Future<void> discardPending(String barcode) async {
+    final staged = pending[barcode];
+    if (staged?.draftId == null || staged!.isNew == false) {
+      message('This draft cannot be discarded through the current API.');
+      return;
+    }
+    try {
+      await api.discardProductDraft(staged.draftId!);
+      await refreshFromDatabase();
+      if (mounted) message('Draft discarded in PostgreSQL.');
+    } catch (e) {
+      if (mounted) message('Could not discard draft: $e');
+    }
   }
 
   // Dark, compact staging panel inspired by the IONYK live-counters card.
@@ -442,9 +450,9 @@ class _AdminProductsPageState extends State<AdminProductsPage> {
         const SizedBox(height: 12),
         SizedBox(width: double.infinity, height: 43,
           child: FilledButton.icon(
-            onPressed: entries.isEmpty ? null : publishPending,
+            onPressed: pending.isEmpty ? null : publishPending,
             icon: const Icon(Icons.publish_rounded, size: 16),
-            label: const Text('Publish to POS · Demo',
+            label: const Text('Publish to POS',
               style: TextStyle(fontSize: 12,
                 fontWeight: FontWeight.w700)),
             style: FilledButton.styleFrom(
@@ -456,7 +464,7 @@ class _AdminProductsPageState extends State<AdminProductsPage> {
                 borderRadius: BorderRadius.circular(10))),
           )),
         const SizedBox(height: 9),
-        const Text('Local preview only · No terminal sync yet',
+        const Text('Select target counters before publishing',
           style: TextStyle(color: subdued, fontSize: 9),
           textAlign: TextAlign.left),
       ]),
@@ -518,20 +526,39 @@ class _AdminProductsPageState extends State<AdminProductsPage> {
             border: OutlineInputBorder(borderRadius: BorderRadius.circular(11), borderSide: BorderSide.none),
           )),
         const SizedBox(height: 15),
-        Expanded(child: LayoutBuilder(builder: (context, constraints) =>
-          SingleChildScrollView(
-            scrollDirection: Axis.vertical,
-            child: Scrollbar(
-            controller: tableHorizontalScroll,
-            thumbVisibility: true,
-            scrollbarOrientation: ScrollbarOrientation.bottom,
-            child: SingleChildScrollView(
-            controller: tableHorizontalScroll,
-            scrollDirection: Axis.horizontal,
-            child: SizedBox(
-              width: constraints.maxWidth < 1680 ? 1680 : constraints.maxWidth,
-              child: Table(
-                columnWidths: const {
+        // Keep the horizontal scroll viewport as tall as the entire remaining
+        // catalogue area. This anchors its scrollbar to the card bottom, not
+        // to the header row. The inner body gets its own vertical scrolling.
+        Expanded(
+          child: LayoutBuilder(
+            builder: (context, constraints) => Stack(
+              children: [
+                Positioned.fill(child: ScrollConfiguration(
+              behavior: const MaterialScrollBehavior().copyWith(
+                dragDevices: {
+                  PointerDeviceKind.touch,
+                  PointerDeviceKind.mouse,
+                  PointerDeviceKind.trackpad,
+                },
+              ),
+              child: Scrollbar(
+                controller: tableHorizontalScroll,
+                thumbVisibility: true,
+                trackVisibility: true,
+                scrollbarOrientation: ScrollbarOrientation.bottom,
+                child: SingleChildScrollView(
+                  controller: tableHorizontalScroll,
+                  scrollDirection: Axis.horizontal,
+                  // Full height allows dragging the empty white area to pan.
+                  child: SizedBox(
+                    width: constraints.maxWidth < 1680
+                        ? 1680
+                        : constraints.maxWidth,
+                    height: constraints.maxHeight,
+                    child: Column(
+                      children: [
+                        Table(
+                          columnWidths: const {
                   0: FixedColumnWidth(58),
                   1: FixedColumnWidth(260),
                   2: FixedColumnWidth(145),
@@ -545,9 +572,10 @@ class _AdminProductsPageState extends State<AdminProductsPage> {
                   10: FixedColumnWidth(165),
                   11: FixedColumnWidth(100),
                 },
-                defaultVerticalAlignment: TableCellVerticalAlignment.middle,
-                children: [
-                  TableRow(
+                          defaultVerticalAlignment:
+                              TableCellVerticalAlignment.middle,
+                          children: [
+                            TableRow(
                     decoration: const BoxDecoration(color: soft),
                     children: [
                       for (final title in [
@@ -560,7 +588,32 @@ class _AdminProductsPageState extends State<AdminProductsPage> {
                           header: true),
                     ],
                   ),
-                  for (var rowIndex = 0; rowIndex < matches.length; rowIndex++)
+                          ],
+                        ),
+                        Expanded(
+                          child: matches.isEmpty
+                              ? const SizedBox.expand()
+                              : SingleChildScrollView(
+                                  scrollDirection: Axis.vertical,
+                                  child: Table(
+                                    columnWidths: const {
+                  0: FixedColumnWidth(58),
+                  1: FixedColumnWidth(260),
+                  2: FixedColumnWidth(145),
+                  3: FixedColumnWidth(125),
+                  4: FixedColumnWidth(140),
+                  5: FixedColumnWidth(145),
+                  6: FixedColumnWidth(130),
+                  7: FixedColumnWidth(115),
+                  8: FixedColumnWidth(140),
+                  9: FixedColumnWidth(140),
+                  10: FixedColumnWidth(165),
+                  11: FixedColumnWidth(100),
+                },
+                                    defaultVerticalAlignment:
+                                        TableCellVerticalAlignment.middle,
+                                    children: [
+                                      for (var rowIndex = 0; rowIndex < matches.length; rowIndex++)
                     TableRow(
                       decoration: BoxDecoration(
                         color: selectedProductBarcode == matches[rowIndex].barcode
@@ -620,19 +673,45 @@ class _AdminProductsPageState extends State<AdminProductsPage> {
                         ), barcode: matches[rowIndex].barcode),
                       ],
                     ),
-                ],
-              ),
+                                    ],
+                                  ),
+                                ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                ))),
+                if (matches.isEmpty)
+                  const Positioned.fill(
+                    top: 42, // below the catalogue column headings
+                    child: IgnorePointer(
+                      child: Center(
+                        child: Text(
+                          'No products found.',
+                          style: TextStyle(fontSize: 12, color: muted),
+                        ),
+                      ),
+                    ),
+                  ),
+              ],
             ),
           ),
-          ),
-          ),
-        )),
-        if (matches.isEmpty) const Padding(padding: EdgeInsets.all(24),
-          child: Center(child: Text('No products found.', style: TextStyle(fontSize: 12, color: muted)))),
+        ),
       ]));
 
   @override
   Widget build(BuildContext context) {
+    if (loading) return const Center(child: CircularProgressIndicator());
+    if (loadError != null) {
+      return Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
+        const Text('Unable to connect to IONYK API.'),
+        const SizedBox(height: 8),
+        Text(loadError!, textAlign: TextAlign.center),
+        const SizedBox(height: 10),
+        FilledButton(onPressed: refreshFromDatabase, child: const Text('Retry')),
+      ]));
+    }
     final matches = products.where((p) =>
       '${p.name} ${p.barcode} ${p.category} ${p.supplier}'.toLowerCase().contains(query.toLowerCase())).toList();
     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [

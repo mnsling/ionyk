@@ -4,6 +4,7 @@ import 'workspace_pages.dart';
 import 'admin_products_page.dart';
 import 'admin_workspaces.dart';
 import 'ionyk_brand.dart';
+import 'ionyk_api.dart';
 import 'transactions_page.dart';
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
@@ -81,6 +82,8 @@ class _LoginPageState extends State<LoginPage> {
   final username = TextEditingController();
   final password = TextEditingController();
   bool hide = true;
+  bool signingIn = false;
+  String? loginError;
 
   @override
   void dispose() {
@@ -146,18 +149,32 @@ class _LoginPageState extends State<LoginPage> {
       TextField(controller: password, obscureText: hide, onSubmitted: (_) => _enter(), decoration: InputDecoration(hintText: 'Enter your password', prefixIcon: const Icon(Icons.lock_outline_rounded, size: 19), filled: true, fillColor: Palette.bg, contentPadding: const EdgeInsets.symmetric(vertical: 17), enabledBorder: OutlineInputBorder(borderSide: BorderSide.none, borderRadius: BorderRadius.circular(12)), focusedBorder: OutlineInputBorder(borderSide: const BorderSide(color: Palette.green), borderRadius: BorderRadius.circular(12)), suffixIcon: IconButton(tooltip: 'Toggle password visibility', onPressed: () => setState(() => hide = !hide), icon: Icon(hide ? Icons.visibility_outlined : Icons.visibility_off_outlined, size: 18)))),
       const SizedBox(height: 23),
       SizedBox(height: 52, child: FilledButton(
-        onPressed: _enter,
+        onPressed: signingIn ? null : _enter,
         style: FilledButton.styleFrom(backgroundColor: Palette.dark, foregroundColor: Colors.white, shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(13))),
         child: const Row(mainAxisAlignment: MainAxisAlignment.center, children: [Text('Enter workspace', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600)), SizedBox(width: 13), Icon(Icons.arrow_forward_rounded, size: 17)]),
       )),
       const SizedBox(height: 20),
-      const Text('DESIGN PREVIEW · Accounts and passwords are not validated yet. Access control will be enforced by the backend in production.', style: TextStyle(color: Palette.muted, fontSize: 9.5, height: 1.7), textAlign: TextAlign.center),
+      if (loginError != null) Text(loginError!, style: const TextStyle(color: Colors.redAccent, fontSize: 11), textAlign: TextAlign.center),
+      const Text('Local development login · The backend validates usernames and passwords.', style: TextStyle(color: Palette.muted, fontSize: 9.5), textAlign: TextAlign.center),
     ]),
   );
 
-  void _enter() => Navigator.of(context).pushReplacement(
-    MaterialPageRoute(builder: (_) => DashboardShell(role: role)),
-  );
+  Future<void> _enter() async {
+    if (signingIn) return;
+    setState(() { signingIn=true; loginError=null; });
+    try {
+      final result = await const IonykApi().login(username.text.trim(),password.text);
+      final actualRole = result['role'] == 'admin' ? UserRole.admin : UserRole.cashier;
+      if (role != actualRole) {
+        await const IonykApi().logout();
+        throw Exception('Select the correct workspace for this account.');
+      }
+      if (!mounted) return;
+      Navigator.of(context).pushReplacement(MaterialPageRoute(
+        builder: (_) => DashboardShell(role: actualRole)));
+    } catch (e) { if (mounted) setState(() => loginError='Login failed: $e'); }
+    finally { if (mounted) setState(() => signingIn=false); }
+  }
 
   Widget _brandPanel() => Container(
     padding: const EdgeInsets.all(48),
@@ -213,6 +230,11 @@ class _DashboardShellState extends State<DashboardShell> {
   List<String> get pages => admin
     ? ['Overview', 'Products', 'Inventory', 'Suppliers', 'Analytics', 'Cash reconciliation', 'Settings']
     : ['Point of sale', 'Transactions', 'Cash closing'];
+  Future<void> _signOut() async {
+    await const IonykApi().logout();
+    if (!mounted) return;
+    Navigator.of(context).pushReplacement(MaterialPageRoute(builder:(_)=>const LoginPage()));
+  }
   List<IconData> get icons => admin
     ? [Icons.grid_view_rounded, Icons.inventory_2_outlined, Icons.warehouse_outlined, Icons.local_shipping_outlined, Icons.bar_chart_rounded, Icons.account_balance_wallet_outlined, Icons.settings_outlined]
     : [Icons.point_of_sale_rounded, Icons.receipt_long_rounded, Icons.payments_outlined];
@@ -255,8 +277,7 @@ class _DashboardShellState extends State<DashboardShell> {
             SizedBox(height: 8), Text('Connection preview', style: TextStyle(fontSize: 10, color: Color(0xFFC0C5CB))),
           ])),
           const SizedBox(height: 10),
-          _SidebarSignOutButton(onPressed: () => Navigator.of(context).pushReplacement(
-            MaterialPageRoute(builder: (_) => const LoginPage()))),
+          _SidebarSignOutButton(onPressed: _signOut),
         ]),
       );
 
@@ -289,40 +310,119 @@ class _DashboardShellState extends State<DashboardShell> {
         ],
       ),
       Text(pages[tab], style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
+      if (narrow && !admin) ...[const SizedBox(width: 10), Flexible(child: Text(IonykApi.currentDisplayName ?? IonykApi.currentUsername ?? 'Cashier', overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 11, color: Palette.muted)))],
       const Spacer(),
       if (!narrow) Container(
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
         decoration: BoxDecoration(color: Palette.bg, borderRadius: BorderRadius.circular(20)),
-        child: Text(admin ? 'ADMIN WORKSPACE' : 'CASHIER 1  ·  COUNTER 01', style: const TextStyle(color: Palette.muted, fontSize: 9.5, letterSpacing: .2, fontWeight: FontWeight.w600)),
+        child: Text(admin ? 'ADMIN WORKSPACE' : '${IonykApi.currentDisplayName ?? IonykApi.currentUsername ?? 'Cashier'} · Counter ${IonykApi.currentTerminalId?.toString().padLeft(2, '0') ?? '--'}', style: const TextStyle(color: Palette.muted, fontSize: 9.5, letterSpacing: .2, fontWeight: FontWeight.w600)),
       ),
       // Small-window fallback: sidebar is hidden, so sign out remains accessible.
-      if (narrow) _SidebarSignOutButton(onPressed: () => Navigator.of(context).pushReplacement(
-        MaterialPageRoute(builder: (_) => const LoginPage()))),
+      if (narrow) _SidebarSignOutButton(onPressed: _signOut),
     ]),
   );
 
-  Widget _overview(double width) {
-    final columns = width > 1050 ? 4 : width > 680 ? 2 : 1;
-    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-      Row(children: [Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        const Text('Business overview', style: TextStyle(fontSize: 27, fontWeight: FontWeight.w600, letterSpacing: -.8)),
-        const SizedBox(height: 6), const Text('A clear view of your store, in real time.', style: TextStyle(fontSize: 12, color: Palette.muted)),
-      ])), _button('Export report', Icons.file_download_outlined, dark: false), const SizedBox(width: 9), _button('View products', Icons.arrow_forward, onTap: () => setState(() => tab = 1))]),
-      const SizedBox(height: 25),
-      GridView.count(shrinkWrap: true, physics: const NeverScrollableScrollPhysics(), crossAxisCount: columns, crossAxisSpacing: 14, mainAxisSpacing: 14, childAspectRatio: columns == 4 ? 1.62 : 2.1, children: [
-        _metric('Total revenue', '₱84,295.00', '+12.8%', 'vs. yesterday', Palette.peach, Icons.north_east_rounded),
-        _metric('Transactions', '328', '+8.2%', 'across 3 counters', Palette.paper, Icons.receipt_long_outlined),
-        _metric('Products sold', '1,482', '+5.4%', 'items sold today', Palette.blue, Icons.inventory_2_outlined),
-        _metric('Low-stock alerts', '24', 'Needs review', '6 items critical', Palette.lime, Icons.warning_amber_rounded),
-      ]),
-      const SizedBox(height: 15),
-      if (width > 800) Row(crossAxisAlignment: CrossAxisAlignment.start, children: [Expanded(flex: 7, child: _salesChart()), const SizedBox(width: 15), Expanded(flex: 4, child: _counterCard())])
-      else Column(children: [_salesChart(), const SizedBox(height: 15), _counterCard()]),
-      const SizedBox(height: 15),
-      if (width > 800) Row(crossAxisAlignment: CrossAxisAlignment.start, children: [Expanded(flex: 7, child: _productsTable()), const SizedBox(width: 15), Expanded(flex: 4, child: _activityCard())])
-      else Column(children: [_productsTable(), const SizedBox(height: 15), _activityCard()]),
-    ]);
-  }
+  Future<Map<String,dynamic>>? _overviewRequest;
+  Future<Map<String,dynamic>> get _stats =>
+      _overviewRequest ??= const IonykApi().testOverview();
+
+  Widget _overview(double width) => FutureBuilder<Map<String,dynamic>>(
+    future:_stats,
+    builder:(ctx,snapshot) {
+      final stats=snapshot.data;
+      final counters=((stats?['counters'] as List?)??const [])
+        .map((e)=>Map<String,dynamic>.from(e as Map)).toList();
+      final gross=double.tryParse('${stats?['gross_sales']??0}')??0;
+      final active=counters.where((c)=>c['live']==true).length;
+      final entries=<(String,String,IconData)>[
+        ('Gross sales', '₱${gross.toStringAsFixed(2)}', Icons.payments_outlined),
+        ('Transactions', '${stats?['transactions']??0}', Icons.receipt_long_outlined),
+        ('Items sold', '${stats?['items_sold']??0}', Icons.shopping_bag_outlined),
+        ('Gross profit', '--', Icons.trending_up_outlined),
+        ('Stock value', '--', Icons.inventory_2_outlined),
+        ('Low stock', '--', Icons.warning_amber_outlined),
+        ('Active counters', '$active', Icons.point_of_sale_outlined),
+        ('Cash variance', '--', Icons.balance_outlined),
+      ];
+      return Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
+        Row(children:[
+          const Expanded(child:Text('Business overview',style:TextStyle(fontSize:27,fontWeight:FontWeight.w600))),
+          TextButton.icon(onPressed:(){setState(()=>_overviewRequest=null);},
+            icon:const Icon(Icons.refresh,size:16),label:const Text('Refresh stats')),
+        ]),
+        const SizedBox(height:5),
+        const Text('DEVELOPMENT TEST SALES ONLY · not official store revenue',
+          style:TextStyle(color:Palette.muted,fontSize:11)),
+        if(snapshot.hasError) Padding(padding:const EdgeInsets.only(top:8),child:
+          Text('Stats unavailable: ${snapshot.error}',style:const TextStyle(color:Colors.red))),
+        const SizedBox(height:18),
+        LayoutBuilder(builder:(context,constraints){
+          final columns=constraints.maxWidth>=950?4:constraints.maxWidth>=530?2:1;
+          return Column(children:[
+            for(int row=0;row<entries.length;row+=columns)
+              Padding(padding:const EdgeInsets.only(bottom:12),child:Row(children:[
+                for(int i=row;i<row+columns;i++) ...[
+                  if(i>row)const SizedBox(width:12),
+                  Expanded(child:i<entries.length?_metric(entries[i].$1,entries[i].$2,'',
+                    'Development test data',Colors.white,entries[i].$3):const SizedBox()),
+                ],
+              ])),
+          ]);
+        }),
+        const SizedBox(height:10),
+        LayoutBuilder(builder:(context,constraints){
+          final wide=constraints.maxWidth>=840;
+          final performance=_surface(child:Padding(padding:const EdgeInsets.all(22),child:Column(
+            crossAxisAlignment:CrossAxisAlignment.start,children:[
+            const Text('Sales performance',style:TextStyle(fontSize:15,fontWeight:FontWeight.w600)),
+            const SizedBox(height:5),
+            const Text('Test sales total · weekly graph pending real time-series API',
+              style:TextStyle(fontSize:11,color:Palette.muted)),
+            const SizedBox(height:14),
+            Text('₱${gross.toStringAsFixed(2)}',style:const TextStyle(fontSize:26,fontWeight:FontWeight.w600)),
+            const SizedBox(height:14),
+            SizedBox(height:135,width:double.infinity,child:CustomPaint(painter:_FlatZeroLinePainter())),
+            const SizedBox(height:8),
+            Row(mainAxisAlignment:MainAxisAlignment.spaceBetween,children:[
+              for(final day in ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'])
+                Text(day,style:const TextStyle(fontSize:10,color:Palette.muted)),
+            ]),
+          ])));
+          final liveCard=Container(padding:const EdgeInsets.all(20),decoration:BoxDecoration(
+            color:Palette.dark,borderRadius:BorderRadius.circular(18)),
+            child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
+              Row(children:[const Expanded(child:Text('Live counters',style:TextStyle(color:Colors.white,fontWeight:FontWeight.bold,fontSize:15))),
+                Text('$active active',style:const TextStyle(color:Palette.lime,fontSize:11))]),
+              const SizedBox(height:18),
+              if(counters.isEmpty)const Text('No counters created',style:TextStyle(color:Colors.white70)),
+              ...counters.map((c){
+                final sale=double.tryParse('${c['sales']??0}')??0;
+                final portion=gross>0?(sale/gross).clamp(0.0,1.0):0.0;
+                return Padding(padding:const EdgeInsets.only(bottom:15),child:Column(
+                  crossAxisAlignment:CrossAxisAlignment.start,children:[
+                  Row(children:[Expanded(child:Text('${c['label']} · ${c['display_name']??''}',
+                    overflow:TextOverflow.ellipsis,style:const TextStyle(color:Colors.white,fontSize:11))),
+                    Text(c['live']==true?'Live':'Offline',style:TextStyle(fontSize:10,
+                      color:c['live']==true?Palette.lime:Colors.white54))]),
+                  const SizedBox(height:5),
+                  Text('₱${sale.toStringAsFixed(2)} test sales',style:const TextStyle(color:Colors.white70,fontSize:10)),
+                  const SizedBox(height:7),
+                  ClipRRect(borderRadius:BorderRadius.circular(5),child:LinearProgressIndicator(
+                    minHeight:6,value:portion,backgroundColor:const Color(0xFF354239),valueColor:const AlwaysStoppedAnimation<Color>(Palette.lime))),
+                ]));
+              }),
+              const Text('Live = recent activity within 5 minutes; refresh to update.',
+                style:TextStyle(color:Colors.white54,fontSize:9)),
+            ]));
+          if(wide)return Row(crossAxisAlignment:CrossAxisAlignment.start,children:[
+            Expanded(flex:3,child:performance),const SizedBox(width:12),
+            Expanded(flex:2,child:liveCard),
+          ]);
+          return Column(children:[performance,const SizedBox(height:12),liveCard]);
+        }),
+      ]);
+    },
+  );
 
   Widget _surface({required Widget child, Color color = Palette.paper}) => Container(decoration: BoxDecoration(color: color, border: Border.all(color: color == Palette.paper ? Palette.border : Colors.transparent), borderRadius: BorderRadius.circular(18)), child: child);
   Widget _metric(String label, String value, String change, String caption, Color color, IconData icon) => _surface(color: color, child: Padding(padding: const EdgeInsets.all(18), child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
@@ -482,4 +582,19 @@ class _SidebarSignOutButtonState extends State<_SidebarSignOutButton> {
       ),
     ),
   );
+}
+
+// Flat baseline only — this is a visual empty state, not fabricated sales data.
+class _FlatZeroLinePainter extends CustomPainter {
+  @override
+  void paint(Canvas canvas, Size size) {
+    final guide = Paint()..color = const Color(0xFFE8ECE8)..strokeWidth = 1;
+    for (final y in [0.0, .33, .66, 1.0]) {
+      canvas.drawLine(Offset(0, size.height * y), Offset(size.width, size.height * y), guide);
+    }
+    final baseline = Paint()..color = const Color(0xFF8BA83B)..strokeWidth = 2.5..strokeCap = StrokeCap.round;
+    canvas.drawLine(Offset(0, size.height * .95), Offset(size.width, size.height * .95), baseline);
+  }
+  @override
+  bool shouldRepaint(covariant _FlatZeroLinePainter oldDelegate) => false;
 }

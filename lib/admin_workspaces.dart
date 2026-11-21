@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 import 'ionyk_brand.dart';
+import 'counter_management.dart';
+import 'admin_credentials_panel.dart';
 
 const _ink = Color(0xFF171B1C);
 const _muted = Color(0xFF6D7772);
@@ -226,14 +228,24 @@ class _AdminWorkspacePageState extends State<AdminWorkspacePage> {
   Widget build(BuildContext context) => AnimatedBuilder(
     animation: IonykBrand.instance,
     builder: (context, _) => switch (widget.title) {
-      'Inventory' => inventory(),
-      'Suppliers' => suppliers(),
-      'Analytics' => analytics(),
-      'Cash reconciliation' => reconciliation(),
+      'Inventory' => emptyDataPage('Inventory'),
+      'Suppliers' => emptyDataPage('Suppliers'),
+      'Analytics' => emptyDataPage('Analytics'),
+      'Cash reconciliation' => emptyDataPage('Cash reconciliation'),
       'Settings' => settings(),
       _ => const SizedBox.shrink(),
     },
   );
+
+  Widget emptyDataPage(String name) => Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
+    sectionTitle(name,'No recorded data yet.'),
+    const SizedBox(height:18),
+    card(const SizedBox(height:300,child:Center(child:Column(mainAxisSize:MainAxisSize.min,children:[
+      Icon(Icons.inbox_outlined,size:32,color:_muted),SizedBox(height:12),
+      Text('No records yet',style:TextStyle(fontWeight:FontWeight.w600,fontSize:14)),
+      SizedBox(height:6),Text('Records will appear once this feature is connected to the database.',style:TextStyle(color:_muted,fontSize:11)),
+    ])))),
+  ]);
 
   Widget inventory() => Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
     sectionTitle('Inventory', 'Track what is physically available, received, sold and adjusted.', trailing: button('Receive stock', Icons.add_box_outlined, primary: true)),
@@ -345,6 +357,10 @@ class _AdminWorkspacePageState extends State<AdminWorkspacePage> {
   Widget settings() => Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
     sectionTitle('Settings','Personalize the IONYK workspace and configure the store.',trailing:Container(padding:const EdgeInsets.symmetric(horizontal:11,vertical:8),decoration:BoxDecoration(borderRadius:BorderRadius.circular(10),color:IonykBrand.instance.accent),child:const Text('LOCAL APPEARANCE',style:TextStyle(fontSize:10,fontWeight:FontWeight.w700)))),
     const SizedBox(height:18),
+    const CounterManagementPanel(),
+    const SizedBox(height:14),
+    const AdminCredentialsPanel(),
+    const SizedBox(height:14),
     LayoutBuilder(builder:(context,c){
       final left=card(Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
         const Text('Store branding',style:TextStyle(fontSize:15,fontWeight:FontWeight.w600)),const SizedBox(height:5),const Text('The logo replaces the IONYK mark in the sidebar and sign-in screen.',style:TextStyle(fontSize:11,color:_muted)),const SizedBox(height:17),
