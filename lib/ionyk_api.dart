@@ -88,6 +88,44 @@ class IonykApi {
   Future<Map<String,dynamic>> recordTestSale(Map<String,dynamic> sale) async =>
     Map<String,dynamic>.from(await _request('POST','/sales/test',sale));
 
+  /// Saved development transactions; not official tax invoices.
+  Future<List<Map<String,dynamic>>> testTransactions() async =>
+      (await _request('GET','/sales/test') as List)
+          .map((e)=>Map<String,dynamic>.from(e as Map)).toList();
+
+  Future<Map<String,dynamic>> testReceipt(int id) async =>
+      Map<String,dynamic>.from(await _request('GET','/sales/test/$id'));
+
+  /// Stage an update to a published product for approval/publishing.
+  Future<Map<String,dynamic>> createPublishedEditDraft(int productId, Map<String,dynamic> body) async =>
+      Map<String,dynamic>.from(await _request('POST','/products/$productId/draft',body));
+
+  Future<List<Map<String,dynamic>>> inventory() async =>
+      (await _request('GET','/inventory') as List)
+          .map((e)=>Map<String,dynamic>.from(e as Map)).toList();
+  Future<Map<String,dynamic>> receiveStock(int productId,int pieces,int cases,{int? reorderLevel}) async =>
+      Map<String,dynamic>.from(await _request('POST','/inventory/receive',{
+        'product_id':productId,'pieces':pieces,'cases':cases,'reorder_level':reorderLevel,
+      }));
+  Future<List<Map<String,dynamic>>> suppliers() async =>
+      (await _request('GET','/suppliers') as List)
+          .map((e)=>Map<String,dynamic>.from(e as Map)).toList();
+  Future<Map<String,dynamic>> addSupplier(String name,String phone) async =>
+      Map<String,dynamic>.from(await _request('POST','/suppliers',{
+        'name':name,'phone':phone,
+      }));
+
+  /// DEVELOPMENT cash count: only a signed-in cashier can save their counter.
+  /// The backend calculates expected money from test cash receipts, not Flutter.
+  Future<Map<String,dynamic>> saveTestCashCount(Map<String,int> denominations) async =>
+      Map<String,dynamic>.from(await _request('POST','/cash/test-count',
+        {'denominations': denominations}));
+
+  /// Admin review of development cash counts, NOT a fiscal Z-reading.
+  Future<List<Map<String,dynamic>>> testCashReconciliations() async =>
+      (await _request('GET','/cash/test-reconciliations') as List)
+          .map((e)=>Map<String,dynamic>.from(e as Map)).toList();
+
   Future<Map<String,dynamic>> testOverview() async =>
     Map<String,dynamic>.from(await _request('GET','/overview/test'));
 

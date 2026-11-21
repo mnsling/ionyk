@@ -1,7 +1,10 @@
 import 'package:flutter/material.dart';
 import 'ionyk_brand.dart';
 import 'counter_management.dart';
-import 'admin_credentials_panel.dart';
+import 'ionyk_api.dart';
+import 'inventory_management.dart';
+import 'suppliers_management.dart';
+import 'ionyk_admin_table.dart';
 
 const _ink = Color(0xFF171B1C);
 const _muted = Color(0xFF6D7772);
@@ -193,45 +196,24 @@ class _AdminWorkspacePageState extends State<AdminWorkspacePage> {
     ])), Text('${rows.length} rows', style: const TextStyle(fontSize: 10, color: _muted))]),
     if (filter) ...[const SizedBox(height: 17), filterBar()],
     const SizedBox(height: 12),
-    LayoutBuilder(builder: (context, c) {
-      final visible = rows.asMap().entries.where((r) {
-        final text = r.value.join(' ').toLowerCase();
-        final matchesQuery = text.contains(query.toLowerCase().trim());
-        final matchesStatus = status == 'All' || text.contains(status.toLowerCase());
-        return matchesQuery && matchesStatus;
-      }).toList();
-      final width = c.maxWidth > columns.length * 130 ? c.maxWidth : columns.length * 130.0;
-      return Scrollbar(child: SingleChildScrollView(scrollDirection: Axis.horizontal, child: SizedBox(
-        width: width,
-        child: DataTable(
-          headingRowColor: WidgetStateProperty.all(_bg),
-          headingRowHeight: 42, dataRowMinHeight: 52, dataRowMaxHeight: 56,
-          horizontalMargin: 13, columnSpacing: 22,
-          border: const TableBorder(horizontalInside: BorderSide(color: _line)),
-          headingTextStyle: const TextStyle(fontSize: 10, fontWeight: FontWeight.w600, color: _muted),
-          dataTextStyle: const TextStyle(fontSize: 11, color: _ink),
-          showCheckboxColumn: false,
-          columns: [for (final h in columns) DataColumn(label: Text(h.toUpperCase(), maxLines: 2))],
-          rows: [for (final item in visible) DataRow(
-            selected: selectedRow == item.key,
-            onSelectChanged: (_) => setState(() => selectedRow = item.key),
-            color: WidgetStateProperty.resolveWith((states) => states.contains(WidgetState.selected) ? IonykBrand.instance.accent.withValues(alpha: .23) : Colors.white),
-            cells: [for (final value in item.value) DataCell(Text(value, overflow: TextOverflow.ellipsis))],
-          )],
-        ),
-      )));
-    }),
-    if (rows.isNotEmpty) const Padding(padding: EdgeInsets.only(top: 9), child: Text('Select any row to highlight it. All figures are example data.', style: TextStyle(color: _muted, fontSize: 10))),
+    IonykAdminTable(columns: columns, rows: [
+      for (final row in rows)
+        if (row.join(' ').toLowerCase().contains(query.trim().toLowerCase()) &&
+            (status == 'All' || row.join(' ').toLowerCase().contains(status.toLowerCase())))
+          row,
+    ], emptyMessage: 'No records available'),
+
+    if (rows.isNotEmpty) const Padding(padding: EdgeInsets.only(top: 9), child: Text('Select any row to highlight it. Preview-only tables are not linked to the database.', style: TextStyle(color: _muted, fontSize: 10))),
   ]));
 
   @override
   Widget build(BuildContext context) => AnimatedBuilder(
     animation: IonykBrand.instance,
     builder: (context, _) => switch (widget.title) {
-      'Inventory' => emptyDataPage('Inventory'),
-      'Suppliers' => emptyDataPage('Suppliers'),
-      'Analytics' => emptyDataPage('Analytics'),
-      'Cash reconciliation' => emptyDataPage('Cash reconciliation'),
+      'Inventory' => const IonykInventoryPanel(),
+      'Suppliers' => const IonykSuppliersPanel(),
+      'Analytics' => analyticsLive(),
+      'Cash reconciliation' => reconciliationLive(),
       'Settings' => settings(),
       _ => const SizedBox.shrink(),
     },
@@ -246,6 +228,137 @@ class _AdminWorkspacePageState extends State<AdminWorkspacePage> {
       SizedBox(height:6),Text('Records will appear once this feature is connected to the database.',style:TextStyle(color:_muted,fontSize:11)),
     ])))),
   ]);
+
+  // Phase 12: empty dashboard bento cards. No fabricated stock, purchasing or closings.
+  Widget neutralTable(String heading, List<String> headers, String emptyText) => card(
+    Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      Text(heading, style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w700)),
+      const SizedBox(height: 16),
+      IonykAdminTable(columns: headers, rows: const [], emptyMessage: emptyText),
+    ]),
+  );
+
+  Widget inventoryNeutral()=>Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
+    sectionTitle('Inventory','Stock levels will appear after receiving and stock movement tracking are enabled.'),
+    const SizedBox(height:18),
+    metrics([
+      ('Available stock','--','Not yet tracked',Icons.inventory_2_outlined),
+      ('Low-stock items','--','Reorder levels not configured',Icons.warning_amber_outlined),
+      ('Received today','--','Receiving not yet enabled',Icons.move_to_inbox_outlined),
+      ('Inventory value','--','Waiting for stock records',Icons.account_balance_wallet_outlined),
+    ]),
+    neutralTable('Stock overview',['Product','Available','Reorder level','Status'],'No stock movements recorded yet'),
+  ]);
+
+  Widget suppliersNeutral()=>Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
+    sectionTitle('Suppliers','Purchase orders and deliveries are not connected yet.'),
+    const SizedBox(height:18),
+    metrics([
+      ('Purchase orders','--','No purchasing ledger yet',Icons.receipt_long_outlined),
+      ('Pending deliveries','--','Delivery tracking not enabled',Icons.local_shipping_outlined),
+      ('Purchase amount','--','Not yet calculated',Icons.payments_outlined),
+      ('Supplier cost changes','--','Awaiting purchasing data',Icons.trending_up_outlined),
+    ]),
+    neutralTable('Supplier activity',['Supplier','Products','Last delivery','Status'],'No delivery records available'),
+  ]);
+
+  Widget analyticsLive()=>FutureBuilder<Map<String,dynamic>>(
+    future:const IonykApi().testOverview(),
+    builder:(context,snapshot){
+      final data=snapshot.data;
+      final failed=snapshot.hasError;
+      String money(Object? raw)=>'₱${(num.tryParse('$raw')??0).toStringAsFixed(2)}';
+      return Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
+        sectionTitle('Analytics','Development test sales only · not official store revenue',
+          trailing:button('Refresh',Icons.refresh_rounded,action:()=>setState((){}))),
+        const SizedBox(height:18),
+        if(failed) Padding(padding:const EdgeInsets.only(bottom:12),child:
+          Text('Could not load test sales: ${snapshot.error}',style:const TextStyle(color:Colors.red))),
+        metrics([
+          ('Gross test sales',data==null?'--':money(data['gross_sales']),'Saved development receipts',Icons.payments_outlined),
+          ('Transactions',data==null?'--':'${data['transactions']}','Recorded test payments',Icons.receipt_long_outlined),
+          ('Items sold',data==null?'--':'${data['items_sold']}','Includes manual Grocery units',Icons.shopping_bag_outlined),
+          ('Gross profit','--','Cost reporting not enabled',Icons.insights_outlined),
+        ]),
+        card(Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
+          const Text('Sales activity',style:TextStyle(fontSize:14,fontWeight:FontWeight.w700)),
+          const SizedBox(height:6),
+          const Text('Development sales by day · last 7 days (Philippine time)',style:TextStyle(fontSize:11,color:_muted)),
+          const SizedBox(height:20),
+          SizedBox(height:150,child:CustomPaint(
+            painter:_DailySalesPainter((data?['daily_sales'] as List?)
+              ?.map((e)=>num.tryParse('${(e as Map)['sales']}')?.toDouble()??0.0)
+              .toList()??const <double>[]),
+            size:Size.infinite)),
+          const SizedBox(height:8),
+          Row(mainAxisAlignment:MainAxisAlignment.spaceBetween,children:[
+            for(final d in (data?['daily_sales'] as List?)??const [])
+              Text('${(d as Map)['day']}',style:const TextStyle(fontSize:10,color:_muted)),
+          ]),
+        ])),
+      ]);
+    },
+  );
+
+  String readableBusinessDay(Object? raw) {
+    final value = raw?.toString() ?? '';
+    final parsed = DateTime.tryParse(value);
+    if (parsed == null) return value;
+    const months = ['Jan','Feb','Mar','Apr','May','Jun',
+      'Jul','Aug','Sep','Oct','Nov','Dec'];
+    return '${months[parsed.month-1]} ${parsed.day}, ${parsed.year}';
+  }
+
+  Widget reconciliationLive() => FutureBuilder<List<Map<String,dynamic>>>(
+    future: const IonykApi().testCashReconciliations(),
+    builder: (context, snapshot) {
+      final records = snapshot.data ?? [];
+      final expected = records.fold<double>(0, (n,r) => n +
+        (num.tryParse('${r['expected_cash']}') ?? 0).toDouble());
+      final counted = records.fold<double>(0, (n,r) => n +
+        (num.tryParse('${r['counted_cash']}') ?? 0).toDouble());
+      String fmt(double n) => '₱${n.toStringAsFixed(2)}';
+      return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        sectionTitle('Cash reconciliation',
+          'Development counts only · expected assumes zero opening cash and no cash movements',
+          trailing: button('Refresh', Icons.refresh_rounded,
+            action: ()=>setState(() {}))),
+        const SizedBox(height: 18),
+        if (snapshot.hasError) Padding(padding:const EdgeInsets.only(bottom:12),
+          child:Text('Could not load test cash counts: ${snapshot.error}',
+            style:const TextStyle(color:Colors.red))),
+        metrics([
+          ('Expected cash', snapshot.hasData?fmt(expected):'--',
+            'Based on test cash sales',Icons.account_balance_wallet_outlined),
+          ('Counted cash', snapshot.hasData?fmt(counted):'--',
+            'Saved denomination counts',Icons.payments_outlined),
+          ('Cash variance', snapshot.hasData?fmt(counted-expected):'--',
+            'Counted minus expected',Icons.balance_outlined),
+          ('Recorded test counts',snapshot.hasData?'${records.length}':'--',
+            'Counter-day records',Icons.pending_actions_outlined),
+        ]),
+        card(Column(crossAxisAlignment:CrossAxisAlignment.stretch, children: [
+          const Text('Counter reconciliation',
+            style:TextStyle(fontSize:14,fontWeight:FontWeight.w700)),
+          const SizedBox(height:5),
+          const Text('Each row is a saved development count for one counter and date.',
+            style:TextStyle(fontSize:11,color:_muted)),
+          const SizedBox(height:15),
+          IonykAdminTable(
+            columns:const ['Date','Counter / Cashier','Expected','Counted','Variance'],
+            emptyMessage:'No saved test counts yet. Sign in as a cashier and save a count under Cash Closing.',
+            rows:[for (final r in records) [
+              readableBusinessDay(r['business_day']),
+              '${r['counter_label'] ?? r['terminal_id']} · ${r['cashier_name'] ?? '--'}',
+              fmt((num.tryParse('${r['expected_cash']}')??0).toDouble()),
+              fmt((num.tryParse('${r['counted_cash']}')??0).toDouble()),
+              fmt((num.tryParse('${r['variance']}')??0).toDouble()),
+            ]],
+          ),
+        ])),
+      ]);
+    },
+  );
 
   Widget inventory() => Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
     sectionTitle('Inventory', 'Track what is physically available, received, sold and adjusted.', trailing: button('Receive stock', Icons.add_box_outlined, primary: true)),
@@ -359,8 +472,6 @@ class _AdminWorkspacePageState extends State<AdminWorkspacePage> {
     const SizedBox(height:18),
     const CounterManagementPanel(),
     const SizedBox(height:14),
-    const AdminCredentialsPanel(),
-    const SizedBox(height:14),
     LayoutBuilder(builder:(context,c){
       final left=card(Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
         const Text('Store branding',style:TextStyle(fontSize:15,fontWeight:FontWeight.w600)),const SizedBox(height:5),const Text('The logo replaces the IONYK mark in the sidebar and sign-in screen.',style:TextStyle(fontSize:11,color:_muted)),const SizedBox(height:17),
@@ -393,4 +504,61 @@ class _AdminWorkspacePageState extends State<AdminWorkspacePage> {
       return c.maxWidth>780?Row(crossAxisAlignment:CrossAxisAlignment.start,children:[Expanded(flex:4,child:left),const SizedBox(width:14),Expanded(flex:6,child:right)]):Column(children:[left,const SizedBox(height:14),right]);
     }),
   ]);
+}
+
+// A deliberately flat placeholder rather than fabricated activity.
+class _NeutralLinePainter extends CustomPainter {
+  @override
+  void paint(Canvas canvas,Size size){
+    final grid=Paint()..color=const Color(0xFFE5EAE4)..strokeWidth=1;
+    for(var i=1;i<=3;i++){
+      final y=size.height*i/4;
+      canvas.drawLine(Offset(0,y),Offset(size.width,y),grid);
+    }
+    final line=Paint()..color=const Color(0xFFA4C73C)..strokeWidth=2.5;
+    canvas.drawLine(Offset(0,size.height-6),Offset(size.width,size.height-6),line);
+  }
+  @override
+  bool shouldRepaint(covariant _NeutralLinePainter oldDelegate)=>false;
+}
+
+
+/// Draws real development daily totals (returned by /overview/test).
+/// A flat zero line is correct only if all seven totals are zero.
+class _DailySalesPainter extends CustomPainter {
+  const _DailySalesPainter(this.values);
+  final List<double> values;
+  @override
+  void paint(Canvas canvas, Size size) {
+    final grid=Paint()..color=const Color(0xFFE5EAE4)..strokeWidth=1;
+    for (var i=1;i<=3;i++) {
+      final y=size.height*i/4;
+      canvas.drawLine(Offset(0,y),Offset(size.width,y),grid);
+    }
+    if(values.isEmpty)return;
+    final top=values.fold<double>(0,(a,b)=>b>a?b:a);
+    final baseline=size.height-6;
+    final double range=(baseline-8).clamp(1.0, double.infinity).toDouble();
+    final path=Path();
+    for(var i=0;i<values.length;i++) {
+      final x=values.length==1?size.width/2:size.width*i/(values.length-1);
+      final y=top<=0?baseline:baseline-(values[i]/top)*range;
+      if(i==0) {path.moveTo(x,y);} else {path.lineTo(x,y);}
+    }
+    canvas.drawPath(path,Paint()..color=const Color(0xFFA4C73C)..strokeWidth=2.5..style=PaintingStyle.stroke);
+    final dot=Paint()..color=const Color(0xFFA4C73C);
+    for(var i=0;i<values.length;i++) {
+      final x=values.length==1?size.width/2:size.width*i/(values.length-1);
+      final y=top<=0?baseline:baseline-(values[i]/top)*range;
+      canvas.drawCircle(Offset(x,y),3,dot);
+    }
+  }
+  @override
+  bool shouldRepaint(covariant _DailySalesPainter oldDelegate) {
+    if (oldDelegate.values.length != values.length) return true;
+    for (var i=0;i<values.length;i++) {
+      if (oldDelegate.values[i] != values[i]) return true;
+    }
+    return false;
+  }
 }

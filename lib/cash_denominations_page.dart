@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'report_printing.dart';
 import 'z_reading_page.dart';
+import 'ionyk_api.dart';
 
 class CashDenominationsPage extends StatefulWidget {
   const CashDenominationsPage({super.key});
@@ -13,6 +14,7 @@ class _CashDenominationsPageState extends State<CashDenominationsPage> {
   static const denominations = <double>[1000, 500, 200, 100, 50, 20, 10, 5, 1, .25];
   final controllers = <double, TextEditingController>{for (final d in denominations) d: TextEditingController()};
   bool printing = false;
+  bool savingCount = false;
   static const ink = Color(0xFF171B1C);
   static const muted = Color(0xFF687272);
   static const canvas = Color(0xFFF3F4F1);
@@ -39,6 +41,38 @@ class _CashDenominationsPageState extends State<CashDenominationsPage> {
     } finally {
       if (mounted) setState(() => printing = false);
     }
+  }
+
+  Future<void> saveTestCount() async {
+    if (savingCount) return;
+    if (counts.values.any((n) => n < 0) ||
+        counts.values.every((n) => n == 0)) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('Enter your denomination counts before saving a test reconciliation.')));
+      return;
+    }
+    final ok = await showDialog<bool>(context: context, builder: (ctx) => AlertDialog(
+      title: const Text('Save test cash count?'),
+      content: Text('Counted cash: ${amount(total)}\nThis updates today’s DEVELOPMENT count for your counter. It does not close a fiscal day.'),
+      actions: [
+        TextButton(onPressed: ()=>Navigator.pop(ctx,false),child:const Text('Cancel')),
+        FilledButton(onPressed: ()=>Navigator.pop(ctx,true),child:const Text('Save test count')),
+      ],
+    ));
+    if (!mounted || ok != true) return;
+    setState(()=>savingCount=true);
+    try {
+      final sent = <String,int>{for (final d in denominations)
+        d.toStringAsFixed(2): counts[d]!};
+      final result = await const IonykApi().saveTestCashCount(sent);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content:Text(
+        'Saved test count. Expected ${amount((num.tryParse('${result['expected_cash']}')??0).toDouble())}; '
+        'variance ${amount((num.tryParse('${result['variance']}')??0).toDouble())}.')));
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content:Text('Unable to save test count: $e')));
+    } finally {if (mounted) setState(()=>savingCount=false);}
   }
 
   Widget panel(Widget child) => Container(
@@ -127,6 +161,15 @@ class _CashDenominationsPageState extends State<CashDenominationsPage> {
       ),
       const SizedBox(height: 12),
       SizedBox(
+        width: double.infinity, height: 43,
+        child: OutlinedButton.icon(
+          onPressed: savingCount ? null : saveTestCount,
+          icon: const Icon(Icons.save_outlined, size: 17),
+          label: Text(savingCount ? 'Saving test count…' : 'Save test cash count'),
+        ),
+      ),
+      const SizedBox(height: 8),
+      SizedBox(
         width: double.infinity,
         height: 43,
         child: FilledButton.icon(
@@ -179,7 +222,7 @@ class _CashDenominationsPageState extends State<CashDenominationsPage> {
     ),
     const SizedBox(height: 12),
     const Text(
-      'Preview only: cash counts are not saved, and printing a sample Z-Reading does not close the fiscal day.',
+      'Development cash counts can be saved for testing. Printing does not close a fiscal day or produce a BIR Z-reading.',
       style: TextStyle(color: muted, fontSize: 10),
     ),
   ]);

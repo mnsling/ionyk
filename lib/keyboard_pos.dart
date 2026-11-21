@@ -3,7 +3,7 @@ import 'package:flutter/services.dart';
 import 'ionyk_modal.dart';
 import 'ionyk_api.dart';
 
-/// Visual-only keyboard-first checkout prototype; no transactions are saved.
+/// Development POS: test sales are recorded in PostgreSQL; not fiscal invoices.
 class KeyboardPos extends StatefulWidget {
   const KeyboardPos({super.key});
   @override
@@ -112,10 +112,6 @@ class _KeyboardPosState extends State<KeyboardPos> {
     }
     if (key == LogicalKeyboardKey.f4) {
       _replaceQuantity();
-      return true;
-    }
-    if (key == LogicalKeyboardKey.f3) {
-      _focusScan();
       return true;
     }
     if (key == LogicalKeyboardKey.f9) {
@@ -603,28 +599,46 @@ class _KeyboardPosState extends State<KeyboardPos> {
 
   Future<void> _payment() async {
     if (_lines.isEmpty) { _notice('Scan a product first'); return; }
-    if (_lines.any((l)=>l.product.barcode.startsWith('MANUAL-'))) {
-      _notice('Manual grocery items cannot be saved as a test sale yet. Remove them first.');
-      return;
-    }
     final amount=_total;
     final controller=TextEditingController();
-    final tendered=await _openPosDialog<double>((ctx)=>IonykModal(
-      title:const Text('Test cash payment'),
-      content:Column(mainAxisSize:MainAxisSize.min,crossAxisAlignment:CrossAxisAlignment.start,children:[
-        Text('Amount due: ${_money(amount)}',style:const TextStyle(fontSize:20,fontWeight:FontWeight.bold)),
-        const SizedBox(height:10),
-        const Text('DEVELOPMENT TEST — not a receipt, invoice or official sale.'),
-        const SizedBox(height:12),
+    final tendered=await _openPosDialog<double>((ctx)=>StatefulBuilder(
+      builder:(ctx,refreshDialog)=>IonykModal(
+      title:const Row(children:[Icon(Icons.payments_outlined,size:21),SizedBox(width:10),Text('Cash payment')]),
+      content:SizedBox(width:410,child:Column(
+        mainAxisSize:MainAxisSize.min,crossAxisAlignment:CrossAxisAlignment.stretch,children:[
+        Container(padding:const EdgeInsets.all(18),decoration:BoxDecoration(
+          color:const Color(0xFF151A1A),borderRadius:BorderRadius.circular(14)),
+          child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
+            const Text('AMOUNT DUE',style:TextStyle(fontSize:10,color:Color(0xFFBCC7BD),letterSpacing:1.2)),
+            const SizedBox(height:6),
+            Text(_money(amount),style:const TextStyle(fontSize:30,fontWeight:FontWeight.w700,color:Color(0xFFD9FF57))),
+          ])),
+        const SizedBox(height:18),
         TextField(controller:controller,autofocus:true,
           keyboardType:const TextInputType.numberWithOptions(decimal:true),
           inputFormatters:[FilteringTextInputFormatter.allow(RegExp(r'[0-9.]'))],
-          decoration:const InputDecoration(labelText:'Cash received',prefixText:'₱ '),
-          onSubmitted:(_)=>Navigator.pop(ctx,double.tryParse(controller.text))),
-      ]),
+          decoration:const InputDecoration(labelText:'Cash received',prefixText:'₱ ',
+            hintText:'Enter cash tendered'),
+          onChanged:(_)=>refreshDialog((){}),
+          onSubmitted:(_){ final n=double.tryParse(controller.text);if(n!=null&&n>=amount)Navigator.pop(ctx,n); }),
+        const SizedBox(height:13),
+        Builder(builder:(_){
+          final entered=double.tryParse(controller.text)??0;
+          final enough=entered>=amount;
+          return Container(padding:const EdgeInsets.symmetric(vertical:13,horizontal:15),
+            decoration:BoxDecoration(color:const Color(0xFFF2F5EE),borderRadius:BorderRadius.circular(11)),
+            child:Row(children:[const Expanded(child:Text('Change',style:TextStyle(fontSize:13,fontWeight:FontWeight.w600))),
+              Text(_money(enough?entered-amount:0),style:const TextStyle(fontSize:21,fontWeight:FontWeight.w700))]));
+        }),
+        const SizedBox(height:14),
+        const Text('DEVELOPMENT TEST ONLY · Not an official receipt or BIR invoice',
+          style:TextStyle(fontSize:10,color:Color(0xFF687272))),
+      ])),
       actions:[TextButton(onPressed:()=>Navigator.pop(ctx),child:const Text('Cancel')),
-        FilledButton(onPressed:()=>Navigator.pop(ctx,double.tryParse(controller.text)),child:const Text('Save test sale'))],
-    ));
+        FilledButton(onPressed:(double.tryParse(controller.text)??0)<amount?null:
+          ()=>Navigator.pop(ctx,double.tryParse(controller.text)),
+          child:const Text('Complete test payment'))],
+    )));
     controller.dispose();
     if (!mounted || tendered==null) return;
     if (!tendered.isFinite || tendered<amount) { _notice('Cash received is insufficient'); return; }
@@ -632,14 +646,38 @@ class _KeyboardPosState extends State<KeyboardPos> {
       final saved=await _api.recordTestSale({
         'tendered':tendered,'wholesale':_wholesale,
         'sale_discount_percent':_discountPercent,
-        'items':_lines.map((line)=>{
-          'barcode':line.product.barcode,'quantity':line.quantity,
-          'discount_percent':line.discountPercent,
+        'items':_lines.map((line){
+          final manual = line.product.barcode.startsWith('MANUAL-');
+          return {
+            'barcode':manual ? null : line.product.barcode,
+            'manual':manual,
+            if (manual) 'description':'Grocery',
+            if (manual) 'unit_price':line.product.price,
+            'quantity':line.quantity,
+            'discount_percent':line.discountPercent,
+          };
         }).toList(),
       });
       if (!mounted) return;
       setState(() { _lines.clear();_selected=-1;_lastAddedProduct=null;_discountPercent=0; });
-      _notice('TEST sale #${saved['id']} saved. Change: ₱${saved['change_due']}');
+      await _openPosDialog<void>((ctx)=>IonykModal(
+        title:const Text('Payment saved'),
+        content:SizedBox(width:350,child:Column(mainAxisSize:MainAxisSize.min,
+          crossAxisAlignment:CrossAxisAlignment.stretch,children:[
+          const Icon(Icons.check_circle_outline,size:44,color:Color(0xFF6D9B2B)),
+          const SizedBox(height:10),
+          Text('Test receipt #${saved['receipt_no'] ?? saved['id']}',textAlign:TextAlign.center,
+            style:const TextStyle(fontSize:18,fontWeight:FontWeight.w700)),
+          const SizedBox(height:14),
+          Text('Total: ${_money(amount)}'),
+          Text('Cash: ${_money(tendered)}'),
+          Text('Change: ${_money(tendered-amount)}',style:const TextStyle(fontWeight:FontWeight.w700)),
+          const SizedBox(height:12),
+          const Text('Open Transactions to view the saved receipt.',
+            style:TextStyle(color:Color(0xFF687272),fontSize:11)),
+        ])),
+        actions:[FilledButton(onPressed:()=>Navigator.pop(ctx),child:const Text('Done'))],
+      ));
     } catch(e) { if(mounted) _notice('Unable to save test sale: $e'); }
     _focusScan();
   }
@@ -930,13 +968,12 @@ class _KeyboardPosState extends State<KeyboardPos> {
       Expanded(child: Scrollbar(controller: _shortcutsScrollController, thumbVisibility: true,
         child: ListView(controller: _shortcutsScrollController, primary: false, padding: const EdgeInsets.only(right: 12), children: [
           _shortcut('F2', 'Add Grocery (no barcode)'),
-          _shortcut('F3', 'Focus scanner'),
           _shortcut('F4', 'Edit selected quantity'),
           _shortcut('F9', 'Search published products'),
           _shortcut('Ctrl + ↑ / ↓', 'Select for quantity / discount'),
           _shortcut('4 + scan', 'Add four pieces'),
-          _shortcut('Ctrl + Backspace', 'Void items · Admin approval'),
-          _shortcut('F12', 'Payment (not yet enabled)'),
+          _shortcut('Ctrl + Backspace', 'Void items'),
+          _shortcut('F12', 'Payment / save test transaction'),
         ]),
       )),
     ],

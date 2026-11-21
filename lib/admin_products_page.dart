@@ -2,8 +2,7 @@ import 'dart:ui' show PointerDeviceKind;
 import 'package:flutter/material.dart';
 import 'ionyk_api.dart';
 
-/// IONYK Systems — Products + Price Management preview.
-/// All edits are kept in memory. There is no database or POS synchronization yet.
+/// IONYK Systems — database-backed Products and staged price changes.
 class AdminProductsPage extends StatefulWidget {
   const AdminProductsPage({super.key});
   @override
@@ -15,11 +14,12 @@ class _Product {
       this.supplier, this.stock,
       {this.previousPrice, this.previousCasePrice, this.unitsPerCase = 1,
       this.caseBarcode = '', this.sellingUnits = 'piece',
-      double? caseCost, double? casePrice})
+      double? caseCost, double? casePrice, this.productId})
       : caseCost = caseCost ?? cost * unitsPerCase,
         casePrice = casePrice ?? price * unitsPerCase;
 
   final String barcode;
+  final int? productId;
   String name;
   String category;
   double cost; // normalized supplier cost per individual piece
@@ -38,7 +38,7 @@ class _Product {
       supplier, stock, previousPrice: previousPrice,
       previousCasePrice: previousCasePrice,
       unitsPerCase: unitsPerCase, caseBarcode: caseBarcode,
-      sellingUnits: sellingUnits, caseCost: caseCost, casePrice: casePrice);
+      sellingUnits: sellingUnits, caseCost: caseCost, casePrice: casePrice, productId: productId);
 
   String get packagingLabel => switch (sellingUnits) {
     'both' => 'Piece + Case',
@@ -83,7 +83,7 @@ class _AdminProductsPageState extends State<AdminProductsPage> {
   int _asInt(Object? v) => int.tryParse('$v') ?? 0;
   String _asString(Object? v) => v?.toString() ?? '';
 
-  _Product _draftProduct(Map<String, dynamic> data) {
+  _Product _draftProduct(Map<String, dynamic> data, {int? productId}) {
     final cost = _asDouble(data['supplier_cost_per_piece']);
     final price = _asDouble(data['piece_price']);
     final quantity = _asInt(data['pieces_per_case']);
@@ -97,6 +97,7 @@ class _AdminProductsPageState extends State<AdminProductsPage> {
       caseBarcode: _asString(data['case_barcode']),
       sellingUnits: _asString(data['selling_units']).isEmpty ? 'piece' : _asString(data['selling_units']),
       casePrice: data['case_price'] == null ? price * qty : _asDouble(data['case_price']),
+      productId: productId,
     );
   }
 
@@ -130,6 +131,7 @@ class _AdminProductsPageState extends State<AdminProductsPage> {
           caseBarcode: _asString(row['case_barcode']),
           sellingUnits: unit,
           casePrice: _asDouble(row['case_price']),
+          productId: _asInt(row['id']),
         ));
       }
       final staged = <String, _PendingProduct>{};
@@ -137,7 +139,7 @@ class _AdminProductsPageState extends State<AdminProductsPage> {
         final raw = row['proposed_data'];
         if (raw is! Map) continue;
         final data = Map<String, dynamic>.from(raw);
-        final product = _draftProduct(data);
+        final product = _draftProduct(data, productId: row['product_id'] == null ? null : _asInt(row['product_id']));
         if (product.barcode.isEmpty) continue;
         staged[product.barcode] = _PendingProduct(product,
           isNew: row['action'] == 'create',
@@ -217,12 +219,9 @@ class _AdminProductsPageState extends State<AdminProductsPage> {
 
   Future<void> edit(_Product product) async {
     final staged = pending[product.barcode];
-    if (staged?.draftId == null || staged!.isNew == false) {
-      message('Editing published products requires the next secured API phase.');
-      return;
-    }
+    final current = staged?.product ?? product;
     final updated = await showDialog<_ProductFormResult>(
-      context: context, builder: (_) => _ProductForm(product: staged.product));
+      context: context, builder: (_) => _ProductForm(product: current));
     if (!mounted || updated == null) return;
     if (updated.caseBarcode.isNotEmpty &&
         (updated.caseBarcode == product.barcode ||
@@ -231,11 +230,18 @@ class _AdminProductsPageState extends State<AdminProductsPage> {
       return;
     }
     try {
-      await api.updateProductDraft(staged.draftId!, _payload(updated, product.barcode));
+      if (staged?.draftId != null) {
+        await api.updateProductDraft(staged!.draftId!, _payload(updated, product.barcode));
+      } else if (product.productId != null) {
+        await api.createPublishedEditDraft(product.productId!, _payload(updated, product.barcode));
+      } else {
+        message('Cannot edit: missing database product ID.');
+        return;
+      }
       await refreshFromDatabase();
-      if (mounted) message('Pending draft updated in PostgreSQL.');
+      if (mounted) message('Product changes saved as a pending draft. Publish to apply.');
     } catch (e) {
-      if (mounted) message('Could not update draft: $e');
+      if (mounted) message('Could not save product changes: $e');
     }
   }
 
@@ -294,12 +300,12 @@ class _AdminProductsPageState extends State<AdminProductsPage> {
 
   Future<void> discardPending(String barcode) async {
     final staged = pending[barcode];
-    if (staged?.draftId == null || staged!.isNew == false) {
-      message('This draft cannot be discarded through the current API.');
+    if (staged?.draftId == null) {
+      message('Draft not found.');
       return;
     }
     try {
-      await api.discardProductDraft(staged.draftId!);
+      await api.discardProductDraft(staged!.draftId!);
       await refreshFromDatabase();
       if (mounted) message('Draft discarded in PostgreSQL.');
     } catch (e) {

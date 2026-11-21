@@ -41,6 +41,7 @@ class IonykApp extends StatelessWidget {
         debugShowCheckedModeBanner: false,
         theme: ThemeData(
           scaffoldBackgroundColor: Palette.bg,
+          fontFamily: GoogleFonts.dmSans().fontFamily,
           colorScheme: ColorScheme.fromSeed(seedColor: IonykBrand.instance.accent, surface: Palette.paper),
           textTheme: GoogleFonts.dmSansTextTheme().apply(bodyColor: Palette.ink, displayColor: Palette.ink),
           useMaterial3: true,
@@ -48,8 +49,8 @@ class IonykApp extends StatelessWidget {
             backgroundColor: Colors.white,
             surfaceTintColor: Colors.transparent,
             shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(22)),
-            titleTextStyle: const TextStyle(color: Palette.ink, fontSize: 19, fontWeight: FontWeight.w700, letterSpacing: -.35),
-            contentTextStyle: const TextStyle(color: Palette.muted, fontSize: 12, height: 1.6),
+            titleTextStyle: GoogleFonts.dmSans(color: Palette.ink, fontSize: 19, fontWeight: FontWeight.w700, letterSpacing: -.35),
+            contentTextStyle: GoogleFonts.dmSans(color: Palette.muted, fontSize: 12, height: 1.6),
           ),
           inputDecorationTheme: InputDecorationTheme(
             filled: true, fillColor: const Color(0xFFF5F6F3),
@@ -334,6 +335,9 @@ class _DashboardShellState extends State<DashboardShell> {
         .map((e)=>Map<String,dynamic>.from(e as Map)).toList();
       final gross=double.tryParse('${stats?['gross_sales']??0}')??0;
       final active=counters.where((c)=>c['live']==true).length;
+      final daily=((stats?['daily_sales'] as List?) ?? const [])
+          .map((raw) => Map<String,dynamic>.from(raw as Map)).toList();
+      final dailyValues=daily.map((d)=>double.tryParse('${d['sales']??0}')??0.0).toList();
       final entries=<(String,String,IconData)>[
         ('Gross sales', '₱${gross.toStringAsFixed(2)}', Icons.payments_outlined),
         ('Transactions', '${stats?['transactions']??0}', Icons.receipt_long_outlined),
@@ -364,7 +368,7 @@ class _DashboardShellState extends State<DashboardShell> {
                 for(int i=row;i<row+columns;i++) ...[
                   if(i>row)const SizedBox(width:12),
                   Expanded(child:i<entries.length?_metric(entries[i].$1,entries[i].$2,'',
-                    'Development test data',Colors.white,entries[i].$3):const SizedBox()),
+                    i<4?'Development test data':'Awaiting backend data',Colors.white,entries[i].$3):const SizedBox()),
                 ],
               ])),
           ]);
@@ -376,23 +380,25 @@ class _DashboardShellState extends State<DashboardShell> {
             crossAxisAlignment:CrossAxisAlignment.start,children:[
             const Text('Sales performance',style:TextStyle(fontSize:15,fontWeight:FontWeight.w600)),
             const SizedBox(height:5),
-            const Text('Test sales total · weekly graph pending real time-series API',
+            const Text('Recorded development sales · last 7 days',
               style:TextStyle(fontSize:11,color:Palette.muted)),
             const SizedBox(height:14),
             Text('₱${gross.toStringAsFixed(2)}',style:const TextStyle(fontSize:26,fontWeight:FontWeight.w600)),
             const SizedBox(height:14),
-            SizedBox(height:135,width:double.infinity,child:CustomPaint(painter:_FlatZeroLinePainter())),
+            SizedBox(height:135,width:double.infinity,child:CustomPaint(painter:_WeeklySalesPainter(dailyValues))),
             const SizedBox(height:8),
             Row(mainAxisAlignment:MainAxisAlignment.spaceBetween,children:[
-              for(final day in ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'])
-                Text(day,style:const TextStyle(fontSize:10,color:Palette.muted)),
+              for(final day in daily)
+                Text('${day['day']}',style:const TextStyle(fontSize:10,color:Palette.muted)),
             ]),
           ])));
           final liveCard=Container(padding:const EdgeInsets.all(20),decoration:BoxDecoration(
             color:Palette.dark,borderRadius:BorderRadius.circular(18)),
             child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
               Row(children:[const Expanded(child:Text('Live counters',style:TextStyle(color:Colors.white,fontWeight:FontWeight.bold,fontSize:15))),
-                Text('$active active',style:const TextStyle(color:Palette.lime,fontSize:11))]),
+                Container(padding:const EdgeInsets.symmetric(horizontal:10,vertical:6),
+                  decoration:BoxDecoration(color:const Color(0xFF2E3930),borderRadius:BorderRadius.circular(14)),
+                  child:Text('$active active',style:const TextStyle(color:Palette.lime,fontSize:11)))]),
               const SizedBox(height:18),
               if(counters.isEmpty)const Text('No counters created',style:TextStyle(color:Colors.white70)),
               ...counters.map((c){
@@ -411,7 +417,7 @@ class _DashboardShellState extends State<DashboardShell> {
                     minHeight:6,value:portion,backgroundColor:const Color(0xFF354239),valueColor:const AlwaysStoppedAnimation<Color>(Palette.lime))),
                 ]));
               }),
-              const Text('Live = recent activity within 5 minutes; refresh to update.',
+              const Text('Bar = share of all test sales. Live = activity in the past 5 minutes.',
                 style:TextStyle(color:Colors.white54,fontSize:9)),
             ]));
           if(wide)return Row(crossAxisAlignment:CrossAxisAlignment.start,children:[
@@ -584,17 +590,39 @@ class _SidebarSignOutButtonState extends State<_SidebarSignOutButton> {
   );
 }
 
-// Flat baseline only — this is a visual empty state, not fabricated sales data.
-class _FlatZeroLinePainter extends CustomPainter {
+// Last seven days of actual PostgreSQL development test sales, normalized to chart height.
+class _WeeklySalesPainter extends CustomPainter {
+  _WeeklySalesPainter(this.values);
+  final List<double> values;
   @override
   void paint(Canvas canvas, Size size) {
     final guide = Paint()..color = const Color(0xFFE8ECE8)..strokeWidth = 1;
     for (final y in [0.0, .33, .66, 1.0]) {
       canvas.drawLine(Offset(0, size.height * y), Offset(size.width, size.height * y), guide);
     }
-    final baseline = Paint()..color = const Color(0xFF8BA83B)..strokeWidth = 2.5..strokeCap = StrokeCap.round;
-    canvas.drawLine(Offset(0, size.height * .95), Offset(size.width, size.height * .95), baseline);
+    final line = Paint()..color = const Color(0xFF88B322)
+      ..strokeWidth = 2.8..strokeCap = StrokeCap.round..strokeJoin = StrokeJoin.round
+      ..style = PaintingStyle.stroke;
+    final point = Paint()..color = const Color(0xFF88B322);
+    if (values.isEmpty) {
+      canvas.drawLine(Offset(0,size.height*.94), Offset(size.width,size.height*.94),line);
+      return;
+    }
+    final maximum = values.fold<double>(0, (a,b) => b>a?b:a);
+    final path = Path();
+    final offsets = <Offset>[];
+    for(var i=0;i<values.length;i++) {
+      final x = size.width * i / (values.length > 1 ? values.length-1 : 1);
+      final y = maximum > 0 ? size.height * (.91 - .79*values[i]/maximum) : size.height*.94;
+      final p = Offset(x,y);
+      offsets.add(p);
+      if(i==0) path.moveTo(x,y); else path.lineTo(x,y);
+    }
+    canvas.drawPath(path,line);
+    for(final p in offsets) canvas.drawCircle(p,3.3,point);
   }
   @override
-  bool shouldRepaint(covariant _FlatZeroLinePainter oldDelegate) => false;
+  bool shouldRepaint(covariant _WeeklySalesPainter old) =>
+      old.values.length != values.length ||
+      List.generate(values.length,(i)=>i).any((i)=>old.values[i] != values[i]);
 }

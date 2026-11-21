@@ -118,6 +118,74 @@ Future<void> main() async {
     return jsonResponse({'ok':true,'username':newUser,'message':'Sign in again with your new credentials'});
   });
 
+  // Stage edits rather than changing live POS prices on Save. Admin-only via middleware.
+  router.post('/products/<id>/draft', (Request request, String id) async {
+    final productId = int.tryParse(id);
+    if (productId == null || productId < 1) return jsonResponse({'error':'Invalid product ID'},status:400);
+    final payload = await readDraftBody(request);
+    if (payload is Response) return payload;
+    final data = Map<String,dynamic>.from(payload as Map);
+    try {
+      final response=await connection.runTx((tx) async {
+        final previous=await tx.execute(Sql.named('''SELECT b.barcode FROM products p
+          JOIN product_barcodes b ON b.product_id=p.id AND b.unit='piece'
+          WHERE p.id=@id AND NOT p.is_archived'''),parameters:{'id':productId});
+        if (previous.isEmpty) throw StateError('Published product not found');
+        if (previous.first[0] != data['piece_barcode']) throw StateError('The primary barcode cannot be changed in this version');
+        final other=await tx.execute(Sql.named('''SELECT product_id FROM product_barcodes
+          WHERE barcode=@code AND product_id<>@id'''),parameters:{'code':data['case_barcode'],'id':productId});
+        if (other.isNotEmpty) throw StateError('Case barcode already belongs to another product');
+        final result=await tx.execute(Sql.named('''INSERT INTO product_drafts (product_id,action,proposed_data)
+          VALUES (@id,'update',CAST(@payload AS jsonb)) RETURNING id'''),parameters:{'id':productId,'payload':jsonEncode(data)});
+        return {'id':result.first[0],'status':'pending'};
+      });
+      return jsonResponse(response,status:201);
+    } catch(e) { return jsonResponse({'error':'Edit draft not saved: $e'},status:400); }
+  });
+
+  // List persisted development sales belonging to the logged-in cashier.
+  router.get('/sales/test', (Request request) async {
+    final viewer=sessionFor(request);
+    if (viewer==null || viewer.role!='cashier') return jsonResponse({'error':'Cashier login required'},status:403);
+    final rows=await connection.execute(Sql.named('''SELECT s.id,s.terminal_id,s.receipt_no,s.total,s.tendered,
+      s.change_due,s.item_count,s.created_at FROM dev_test_sales s
+      WHERE s.cashier_user_id=@user AND s.terminal_id=@counter
+      ORDER BY s.created_at DESC,s.id DESC LIMIT 500'''),
+      parameters:{'user':viewer.userId,'counter':viewer.terminalId});
+    return jsonResponse(rows.map((r)=>{
+      'id':r[0],'terminal_id':r[1],'receipt_no':r[2],'total':num.parse('${r[3]}'),
+      'tendered':num.parse('${r[4]}'),'change_due':num.parse('${r[5]}'),
+      'item_count':r[6],'created_at':r[7].toString(),'is_test':true,
+    }).toList());
+  });
+
+  // Fetch a receipt-style record; authorization prevents cross-cashier access.
+  router.get('/sales/test/<id>', (Request request,String id) async {
+    final viewer=sessionFor(request);
+    if (viewer==null || viewer.role!='cashier') return jsonResponse({'error':'Cashier login required'},status:403);
+    final saleId=int.tryParse(id);
+    if(saleId==null || saleId<1) return jsonResponse({'error':'Invalid receipt ID'},status:400);
+    final sale=await connection.execute(Sql.named('''SELECT s.id,s.terminal_id,s.receipt_no,s.total,s.tendered,
+      s.change_due,s.item_count,s.created_at,u.display_name
+      FROM dev_test_sales s JOIN app_users u ON u.id=s.cashier_user_id
+      WHERE s.id=@id AND s.cashier_user_id=@user AND s.terminal_id=@counter'''),
+      parameters:{'id':saleId,'user':viewer.userId,'counter':viewer.terminalId});
+    if(sale.isEmpty) return jsonResponse({'error':'Receipt not found'},status:404);
+    final r=sale.first;
+    final rows=await connection.execute(Sql.named('''SELECT COALESCE(l.description,p.description,'Grocery'),l.unit,l.quantity,
+      l.unit_price,l.line_total FROM dev_test_sale_lines l
+      LEFT JOIN products p ON p.id=l.product_id WHERE l.sale_id=@id ORDER BY l.id'''),parameters:{'id':saleId});
+    return jsonResponse({
+      'id':r[0],'terminal_id':r[1],'receipt_no':r[2],'total':num.parse('${r[3]}'),
+      'tendered':num.parse('${r[4]}'),'change_due':num.parse('${r[5]}'),
+      'item_count':r[6],'created_at':r[7].toString(),'cashier':r[8], 'is_test':true,
+      'lines':rows.map((x)=>{
+        'description':x[0],'unit':x[1],'quantity':x[2],
+        'unit_price':num.parse('${x[3]}'),'line_total':num.parse('${x[4]}'),
+      }).toList(),
+    });
+  });
+
   // Publish new product drafts atomically and route them to selected active counters.
   // Existing published product edits/archives are intentionally not supported yet.
   router.post('/publish', (Request request) async {
@@ -145,10 +213,24 @@ Future<void> main() async {
         final items=<({int draftId,Map<String,dynamic> data})>[];
         final barcodes=<String>{};
         for (final id in drafts) {
-          final r=await tx.execute(Sql.named("SELECT action,proposed_data FROM product_drafts WHERE id=@id AND status='pending' FOR UPDATE"),parameters:{'id':id});
-          if (r.isEmpty || r.first[0]!='create') throw StateError('Draft $id is missing or not a new product draft');
+          final r=await tx.execute(Sql.named("SELECT action,proposed_data,product_id FROM product_drafts WHERE id=@id AND status='pending' FOR UPDATE"),parameters:{'id':id});
+          if (r.isEmpty || (r.first[0]!='create' && r.first[0]!='update')) throw StateError('Draft $id missing or action unsupported');
           final raw=r.first[1];
           final d=Map<String,dynamic>.from(raw is String ? jsonDecode(raw) as Map : raw as Map);
+          if (r.first[0]=='update') {
+            final productId=r.first[2] as int;
+            final existingTargets=await tx.execute(Sql.named('''SELECT DISTINCT bt.terminal_id
+              FROM publish_batch_targets bt
+              JOIN publish_batch_drafts bd ON bd.batch_id=bt.batch_id
+              JOIN product_drafts d ON d.id=bd.draft_id
+              WHERE d.published_product_id=@id'''),parameters:{'id':productId});
+            for(final target in existingTargets) {
+              if(!targets.contains(target[0])) throw StateError(
+                'Product edits must be published to all previously targeted counters because prices are shared');
+            }
+            items.add((draftId:id,data:d));
+            continue;
+          }
           for (final key in ['piece_barcode','case_barcode']) {
             final barcode=(d[key]??'').toString().trim();
             if (barcode.isEmpty) continue;
@@ -184,6 +266,70 @@ Future<void> main() async {
             final r=await tx.execute(Sql.named('''INSERT INTO suppliers(name) VALUES (@name)
               ON CONFLICT (name) DO UPDATE SET name=EXCLUDED.name RETURNING id'''),parameters:{'name':supplier});
             supplierId=r.first[0] as int;
+          }
+          final draftType=await tx.execute(Sql.named(
+            'SELECT action,product_id FROM product_drafts WHERE id=@id'),
+            parameters:{'id':item.draftId});
+          if (draftType.first[0]=='update') {
+            final productId=draftType.first[1] as int;
+            final oldPrices=await tx.execute(Sql.named(
+              'SELECT unit,selling_price FROM product_prices WHERE product_id=@id'),
+              parameters:{'id':productId});
+            final old={for(final p in oldPrices) p[0] as String:num.parse('${p[1]}')};
+            final oldCodes=await tx.execute(Sql.named(
+              'SELECT unit,barcode FROM product_barcodes WHERE product_id=@id'),
+              parameters:{'id':productId});
+            final code={for(final b in oldCodes) b[0] as String:b[1] as String};
+            if(code['piece']!=pieceCode) throw StateError('Primary barcode cannot change');
+            if(caseCode.isNotEmpty && caseCode!=code['case']) {
+              final clash=await tx.execute(Sql.named(
+                'SELECT 1 FROM product_barcodes WHERE barcode=@code AND product_id<>@id'),
+                parameters:{'code':caseCode,'id':productId});
+              if(clash.isNotEmpty) throw StateError('Case barcode in use');
+            }
+            await tx.execute(Sql.named('''UPDATE products SET description=@desc,
+              category=@category,supplier_id=@supplier,pieces_per_case=@qty,
+              sell_piece=@sellPiece,sell_case=@sellCase,
+              supplier_cost_per_piece=@cost,updated_at=now() WHERE id=@id'''),parameters:{
+              'id':productId,'desc':desc,'category':(d['category']??'').toString(),
+              'supplier':supplierId,'qty':qty,'sellPiece':units!='case',
+              'sellCase':units!='piece','cost':cost});
+            for(final entry in <(String,double)>[('piece',piecePrice.toDouble()),
+              ('case',(casePrice??0).toDouble())]) {
+              final unit=entry.$1;final amount=entry.$2;
+              final enabled=unit=='piece'?units!='case':units!='piece';
+              if(enabled) {
+                await tx.execute(Sql.named('''INSERT INTO product_prices
+                  (product_id,unit,selling_price) VALUES (@id,@unit,@price)
+                  ON CONFLICT(product_id,unit) DO UPDATE SET selling_price=EXCLUDED.selling_price,
+                    effective_at=now()'''),parameters:{'id':productId,'unit':unit,'price':amount});
+                if(old[unit]!=amount) await tx.execute(Sql.named('''INSERT INTO price_history
+                  (product_id,unit,old_price,new_price,publish_batch_id)
+                  VALUES (@id,@unit,@old,@price,@batch)'''),parameters:{
+                    'id':productId,'unit':unit,'old':old[unit],'price':amount,'batch':batchId});
+              } else {
+                await tx.execute(Sql.named(
+                  'DELETE FROM product_prices WHERE product_id=@id AND unit=@unit'),
+                  parameters:{'id':productId,'unit':unit});
+              }
+            }
+            if(caseCode.isNotEmpty) {
+              await tx.execute(Sql.named('''INSERT INTO product_barcodes
+                (product_id,unit,barcode) VALUES (@id,'case',@code)
+                ON CONFLICT (product_id,unit,barcode) DO NOTHING'''),
+                parameters:{'id':productId,'code':caseCode});
+              if(code['case']!=null && code['case']!=caseCode) {
+                await tx.execute(Sql.named('''DELETE FROM product_barcodes
+                  WHERE product_id=@id AND unit='case' AND barcode=@old'''),
+                  parameters:{'id':productId,'old':code['case']});
+              }
+            }
+            await tx.execute(Sql.named('''UPDATE product_drafts SET status='published',
+              published_product_id=@product,published_at=now() WHERE id=@draft'''),
+              parameters:{'product':productId,'draft':item.draftId});
+            await tx.execute(Sql.named('INSERT INTO publish_batch_drafts(batch_id,draft_id) VALUES (@batch,@draft)'),
+              parameters:{'batch':batchId,'draft':item.draftId});
+            continue;
           }
           final prod=await tx.execute(Sql.named('''INSERT INTO products
             (description,category,supplier_id,pieces_per_case,sell_piece,sell_case,supplier_cost_per_piece)
@@ -222,7 +368,7 @@ Future<void> main() async {
     try { body=Map<String,dynamic>.from(jsonDecode(await request.readAsString()) as Map); }
     catch (_) { return jsonResponse({'error':'Invalid JSON'},status:400); }
     if (body['items'] is! List || (body['items'] as List).isEmpty) {
-      return jsonResponse({'error':'Add at least one published product'},status:400);
+      return jsonResponse({'error':'Add at least one item'},status:400);
     }
     final items=(body['items'] as List);
     if (items.length>100) return jsonResponse({'error':'Too many items'},status:400);
@@ -238,7 +384,7 @@ Future<void> main() async {
     double money(double v)=>double.parse(v.toStringAsFixed(2));
     try {
       final data=await connection.runTx((tx) async {
-        final lines=<({int id,String unit,int qty,double price,double total})>[];
+        final lines=<({int? id,String unit,String? description,int qty,double price,double total})>[];
         var subtotal=0.0;var count=0;
         for (final raw in items) {
           if (raw is! Map) throw StateError('Invalid cart line');
@@ -246,10 +392,26 @@ Future<void> main() async {
           final barcode=(line['barcode']??'').toString();
           final qty=line['quantity'];
           final itemDiscount=num.tryParse('${line['discount_percent']??0}');
-          if (barcode.isEmpty || qty is! int || qty<1 || qty>10000 ||
+          if (qty is! int || qty<1 || qty>10000 ||
               itemDiscount==null || !itemDiscount.isFinite || itemDiscount<0 || itemDiscount>100) {
             throw StateError('Invalid item quantity or discount');
           }
+          // Manual Grocery lines are development-only and have no stock product.
+          // The cashier specifies the price; require a positive, finite peso amount.
+          if (line['manual'] == true) {
+            final desc=(line['description']??'').toString();
+            final manualPrice=num.tryParse('${line['unit_price']}');
+            if (desc!='Grocery' || barcode.isNotEmpty && !barcode.startsWith('MANUAL-') ||
+                manualPrice==null || !manualPrice.isFinite || manualPrice<=0 || manualPrice>100000) {
+              throw StateError('Invalid manual Grocery price');
+            }
+            final price=money(manualPrice.toDouble());
+            final lineTotal=money(price*qty*(1-itemDiscount/100));
+            subtotal+=lineTotal;count+=qty;
+            lines.add((id:null,unit:'manual',description:'Grocery',qty:qty,price:price,total:lineTotal));
+            continue;
+          }
+          if (barcode.isEmpty) throw StateError('Published product barcode required');
           final matched=await tx.execute(Sql.named('''SELECT p.id,b.unit,pp.selling_price
             FROM product_barcodes b
             JOIN products p ON p.id=b.product_id AND NOT p.is_archived
@@ -266,31 +428,123 @@ Future<void> main() async {
           final price=money(base*(wholesale?0.9:1.0));
           final lineTotal=money(price*qty*(1-itemDiscount/100));
           subtotal+=lineTotal;count+=qty;
-          lines.add((id:row[0] as int,unit:row[1] as String,qty:qty,price:price,total:lineTotal));
+          lines.add((id:row[0] as int,unit:row[1] as String,description:null,qty:qty,price:price,total:lineTotal));
         }
         final total=money(subtotal*(1-discount/100));
         if (tendered+0.00001<total) throw StateError('Insufficient cash tendered');
         final change=money(tendered-total);
+        // Row-level serialized, rollback-safe receipt allocation per counter.
+        // The global sale ID stays separate and is still used for API lookups.
+        final seq = await tx.execute(Sql.named('''INSERT INTO dev_counter_receipt_sequences (terminal_id,next_number)
+          VALUES (@counter,2)
+          ON CONFLICT (terminal_id) DO UPDATE
+            SET next_number=dev_counter_receipt_sequences.next_number+1
+          RETURNING next_number-1'''),parameters:{'counter':session.terminalId});
+        final receiptNo = (seq.first[0] as num).toInt();
         final sale=await tx.execute(Sql.named('''INSERT INTO dev_test_sales
-          (terminal_id,cashier_user_id,total,tendered,change_due,item_count)
-          VALUES (@counter,@cashier,@total,@cash,@change,@count) RETURNING id'''),
+          (terminal_id,cashier_user_id,receipt_no,total,tendered,change_due,item_count)
+          VALUES (@counter,@cashier,@receipt_no,@total,@cash,@change,@count) RETURNING id'''),
           parameters:{'counter':session.terminalId,'cashier':session.userId,
-            'total':total,'cash':tendered,'change':change,'count':count});
+            'receipt_no':receiptNo,'total':total,'cash':tendered,'change':change,'count':count});
         final saleId=sale.first[0] as int;
         for (final line in lines) {
           await tx.execute(Sql.named('''INSERT INTO dev_test_sale_lines
-            (sale_id,product_id,unit,quantity,unit_price,line_total)
-            VALUES (@sale,@product,@unit,@qty,@price,@total)'''),parameters:{
-            'sale':saleId,'product':line.id,'unit':line.unit,
+            (sale_id,product_id,description,unit,quantity,unit_price,line_total)
+            VALUES (@sale,@product,@description,@unit,@qty,@price,@total)'''),parameters:{
+            'sale':saleId,'product':line.id,'description':line.description,'unit':line.unit,
             'qty':line.qty,'price':line.price,'total':line.total});
         }
         await tx.execute(Sql.named('UPDATE terminals SET last_seen_at=now() WHERE id=@id'),
           parameters:{'id':session.terminalId});
-        return {'id':saleId,'is_test':true,'total':total,'tendered':tendered,
+        return {'id':saleId,'receipt_no':receiptNo,'terminal_id':session.terminalId,'is_test':true,'total':total,'tendered':tendered,
           'change_due':change,'item_count':count};
       });
       return jsonResponse(data,status:201);
     } catch (e) { return jsonResponse({'error':'Test sale not recorded: $e'},status:400); }
+  });
+
+  // Development-only cash counts. These do NOT close any fiscal day.
+  // Expected cash is only the total of saved cash test-sales for this counter
+  // on the Philippine-local date; opening float, cash-in/out, refunds and
+  // other payment types are not modeled. An existing daily count is replaced
+  // explicitly in the development ledger (not an audit-safe production rule).
+  router.post('/cash/test-count', (Request request) async {
+    final session = sessionFor(request);
+    if (session == null || session.role != 'cashier' || session.terminalId == null) {
+      return jsonResponse({'error':'Cashier login required'},status:403);
+    }
+    Map<String,dynamic> body;
+    try {body=Map<String,dynamic>.from(jsonDecode(await request.readAsString()) as Map);}
+    catch (_) {return jsonResponse({'error':'Invalid JSON'},status:400);}
+    if (body['denominations'] is! Map) {
+      return jsonResponse({'error':'Denomination counts required'},status:400);
+    }
+    const values = <String,int>{'1000.00':100000,'500.00':50000,'200.00':20000,
+      '100.00':10000,'50.00':5000,'20.00':2000,'10.00':1000,'5.00':500,
+      '1.00':100,'0.25':25};
+    final entered=Map<String,dynamic>.from(body['denominations'] as Map);
+    if (entered.keys.any((key)=>!values.containsKey(key))) {
+      return jsonResponse({'error':'Unknown denomination'},status:400);
+    }
+    var cents=0;
+    for (final key in values.keys) {
+      final raw=entered[key]??0;
+      if (raw is! int || raw<0 || raw>100000) {
+        return jsonResponse({'error':'Invalid count for $key'},status:400);
+      }
+      cents += raw*values[key]!;
+    }
+    if (cents==0 || cents>100000000000) {
+      return jsonResponse({'error':'Enter a nonzero cash count within the test limit'},status:400);
+    }
+    final result = await connection.runTx((tx) async {
+      final sales=await tx.execute(Sql.named('''SELECT COALESCE(SUM(total),0)
+        FROM dev_test_sales WHERE terminal_id=@counter
+        AND (created_at AT TIME ZONE 'Asia/Manila')::date=(now() AT TIME ZONE 'Asia/Manila')::date'''),
+        parameters:{'counter':session.terminalId});
+      final expected = num.parse('${sales.first[0]}');
+      final counted = cents/100;
+      final variance = double.parse((counted-expected).toStringAsFixed(2));
+      final saved=await tx.execute(Sql.named('''INSERT INTO dev_test_cash_counts
+        (terminal_id,cashier_user_id,business_day,denominations,
+         expected_cash,counted_cash,variance)
+        VALUES (@counter,@cashier,(now() AT TIME ZONE 'Asia/Manila')::date,
+          CAST(@denoms AS jsonb),@expected,@counted,@variance)
+        ON CONFLICT(terminal_id,business_day) DO UPDATE SET
+          cashier_user_id=EXCLUDED.cashier_user_id,
+          denominations=EXCLUDED.denominations,
+          expected_cash=EXCLUDED.expected_cash,
+          counted_cash=EXCLUDED.counted_cash,
+          variance=EXCLUDED.variance,
+          updated_at=now() RETURNING id,business_day'''),parameters:{
+          'counter':session.terminalId,'cashier':session.userId,
+          'denoms':jsonEncode(entered),'expected':expected,
+          'counted':counted,'variance':variance});
+      return {'id':saved.first[0],'terminal_id':session.terminalId,
+        'business_day':'${saved.first[1]}','expected_cash':expected,
+        'counted_cash':counted,'variance':variance,'test_only':true};
+    });
+    return jsonResponse(result,status:201);
+  });
+
+  router.get('/cash/test-reconciliations', (Request request) async {
+    if (sessionFor(request)?.role!='admin') {
+      return jsonResponse({'error':'Admin required'},status:403);
+    }
+    final rows=await connection.execute('''SELECT c.id,c.terminal_id,c.business_day,
+      c.expected_cash,c.counted_cash,c.variance,
+      t.label,u.display_name
+      FROM dev_test_cash_counts c
+      JOIN terminals t ON t.id=c.terminal_id
+      LEFT JOIN app_users u ON u.id=c.cashier_user_id
+      ORDER BY c.business_day DESC,c.terminal_id''');
+    return jsonResponse([for (final r in rows){
+      'id':r[0],'terminal_id':r[1], 'business_day':'${r[2]}',
+      'expected_cash':num.parse('${r[3]}'),
+      'counted_cash':num.parse('${r[4]}'),
+      'variance':num.parse('${r[5]}'),
+      'counter_label':r[6], 'cashier_name':r[7],
+    }]);
   });
 
   // Admin dashboard: test sales are kept separate from real/official reporting.
@@ -304,12 +558,142 @@ Future<void> main() async {
       FROM terminals t LEFT JOIN dev_test_sales s ON s.terminal_id=t.id
       WHERE t.is_active=true
       GROUP BY t.id,t.label,t.display_name,t.last_seen_at ORDER BY t.id''');
+    final daily=await connection.execute('''
+      WITH days AS (
+        SELECT generate_series(
+          (now() AT TIME ZONE 'Asia/Manila')::date - 6,
+          (now() AT TIME ZONE 'Asia/Manila')::date,
+          interval '1 day')::date AS day
+      ), sales AS (
+        SELECT (created_at AT TIME ZONE 'Asia/Manila')::date AS day,
+          sum(total) AS total FROM dev_test_sales GROUP BY 1
+      )
+      SELECT to_char(days.day,'Dy'),COALESCE(sales.total,0)
+      FROM days LEFT JOIN sales ON sales.day=days.day ORDER BY days.day
+    ''');
+    final inventory=await connection.execute('''SELECT
+      COALESCE(SUM(b.quantity_pieces * p.supplier_cost_per_piece),0),
+      COUNT(*) FILTER (WHERE b.reorder_level > 0 AND b.quantity_pieces <= b.reorder_level)
+      FROM dev_stock_balances b JOIN products p ON p.id=b.product_id AND NOT p.is_archived''');
     final r=totals.first;
     return jsonResponse({'gross_sales':num.parse('${r[0]}'),'transactions':r[1],
       'items_sold':r[2],'test_only':true,
+      'inventory_value':num.parse('${inventory.first[0]}'),
+      'low_stock':inventory.first[1],
+      'daily_sales':daily.map((x)=>{'day':x[0].toString().trim(),
+        'sales':num.parse('${x[1]}')}).toList(),
       'counters':counters.map((c)=>{
         'id':c[0],'label':c[1],'display_name':c[2],
         'live':c[3],'sales':num.parse('${c[4]}')}).toList()});
+  });
+
+  // DEVELOPMENT inventory and suppliers. Not fiscal accounting.
+  router.get('/inventory', (Request request) async {
+    if (sessionFor(request)?.role!='admin') return jsonResponse({'error':'Admin required'},status:403);
+    final rows=await connection.execute('''SELECT p.id,p.description,p.pieces_per_case,
+      COALESCE(b.quantity_pieces,0),COALESCE(b.reorder_level,0),
+      p.supplier_cost_per_piece,s.name
+      FROM products p LEFT JOIN dev_stock_balances b ON b.product_id=p.id
+      LEFT JOIN suppliers s ON s.id=p.supplier_id
+      WHERE NOT p.is_archived ORDER BY p.description''');
+    return jsonResponse(rows.map((r)=>{
+      'product_id':r[0], 'description':r[1], 'pieces_per_case':r[2],
+      'quantity_pieces':r[3], 'reorder_level':r[4],
+      'cost_per_piece':num.parse('${r[5]}'),'supplier':r[6],
+    }).toList());
+  });
+
+  router.post('/inventory/receive', (Request request) async {
+    if (sessionFor(request)?.role!='admin') return jsonResponse({'error':'Admin required'},status:403);
+    Map<String,dynamic> body;
+    try {body=Map<String,dynamic>.from(jsonDecode(await request.readAsString()) as Map);}
+    catch(_){return jsonResponse({'error':'Invalid JSON'},status:400);}
+    final product=body['product_id'];
+    final pieces=body['pieces'];
+    final cases=body['cases'];
+    final reorder=body['reorder_level'];
+    if(product is! int || product<1 || pieces is! int || cases is! int ||
+       pieces<0 || cases<0 || (pieces==0 && cases==0) || pieces>1000000 || cases>100000 ||
+       (reorder!=null && (reorder is! int || reorder<0 || reorder>1000000))) {
+      return jsonResponse({'error':'Select a product and valid whole-number quantities'},status:400);
+    }
+    try {
+      final output=await connection.runTx((tx) async {
+        final check=await tx.execute(Sql.named(
+          'SELECT pieces_per_case FROM products WHERE id=@id AND NOT is_archived FOR UPDATE'),
+          parameters:{'id':product});
+        if(check.isEmpty) throw StateError('Published product not found');
+        final perCase=check.first[0] as int;
+        final added=pieces+cases*perCase;
+        // PostgreSQL cannot always infer the type of an untyped NULL bound to
+        // COALESCE. Use two explicit, integer-only statements instead.
+        if (reorder == null) {
+          await tx.execute(Sql.named('''INSERT INTO dev_stock_balances
+            (product_id,quantity_pieces,reorder_level)
+            VALUES (@id,@added,0)
+            ON CONFLICT(product_id) DO UPDATE SET
+              quantity_pieces=dev_stock_balances.quantity_pieces+EXCLUDED.quantity_pieces,
+              updated_at=now()'''),
+            parameters:{'id':product,'added':added});
+        } else {
+          await tx.execute(Sql.named('''INSERT INTO dev_stock_balances
+            (product_id,quantity_pieces,reorder_level)
+            VALUES (@id,@added,@reorder)
+            ON CONFLICT(product_id) DO UPDATE SET
+              quantity_pieces=dev_stock_balances.quantity_pieces+EXCLUDED.quantity_pieces,
+              reorder_level=EXCLUDED.reorder_level,
+              updated_at=now()'''),
+            parameters:{'id':product,'added':added,'reorder':reorder});
+        }
+        await tx.execute(Sql.named('''INSERT INTO dev_stock_movements
+          (product_id,quantity_pieces,movement_type,created_by)
+          VALUES (@id,@added,'receive',@user)'''),
+          parameters:{'id':product,'added':added,'user':sessionFor(request)!.userId});
+        final balance=await tx.execute(Sql.named(
+          'SELECT quantity_pieces FROM dev_stock_balances WHERE product_id=@id'),
+          parameters:{'id':product});
+        return {'product_id':product,'received_pieces':added,'quantity_pieces':balance.first[0]};
+      });
+      return jsonResponse(output,status:201);
+    } catch(e) {return jsonResponse({'error':'Stock not received: $e'},status:400);}
+  });
+
+  router.get('/suppliers', (Request request) async {
+    if (sessionFor(request)?.role!='admin') return jsonResponse({'error':'Admin required'},status:403);
+    final rows=await connection.execute('''SELECT s.id,s.name,s.phone,
+      (SELECT count(*) FROM products p WHERE p.supplier_id=s.id AND NOT p.is_archived)
+      FROM suppliers s ORDER BY lower(s.name)''');
+    return jsonResponse(rows.map((r)=>{'id':r[0],'name':r[1],
+      'phone':r[2],'product_count':r[3]}).toList());
+  });
+  router.post('/suppliers', (Request request) async {
+    if (sessionFor(request)?.role!='admin') return jsonResponse({'error':'Admin required'},status:403);
+    Map<String,dynamic> body;
+    try {body=Map<String,dynamic>.from(jsonDecode(await request.readAsString()) as Map);}
+    catch(_) {return jsonResponse({'error':'Invalid JSON'},status:400);}
+    final name=(body['name']??'').toString().trim();
+    final phone=(body['phone']??'').toString().trim();
+    if(name.isEmpty || name.length>120 || phone.length>40) {
+      return jsonResponse({'error':'Supplier name required (up to 120 characters)'},status:400);
+    }
+    try {
+      final duplicate = await connection.execute(Sql.named('''
+        SELECT id FROM suppliers WHERE lower(trim(name))=lower(@name) LIMIT 1
+      '''), parameters:{'name':name});
+      if (duplicate.isNotEmpty) {
+        return jsonResponse({'error':'A supplier with this name already exists.'},status:409);
+      }
+      final rows=await connection.execute(Sql.named('''INSERT INTO suppliers(name,phone)
+        VALUES (@name,@phone) RETURNING id'''),
+        parameters:{'name':name,'phone':phone});
+      return jsonResponse({'id':rows.first[0],'name':name,'phone':phone},status:201);
+    } catch(e) {
+      // Handle concurrent insertions violating the unique constraint too.
+      if ('$e'.contains('23505') || '$e'.contains('duplicate key')) {
+        return jsonResponse({'error':'Supplier already exists.'},status:409);
+      }
+      return jsonResponse({'error':'Supplier could not be saved: $e'},status:400);
+    }
   });
 
   router.post('/counter/ping', (Request request) async {
@@ -599,7 +983,7 @@ Future<void> main() async {
     final result = await connection.execute(
       Sql.named('''UPDATE product_drafts
           SET proposed_data = CAST(@payload AS jsonb)
-          WHERE id = @id AND status = 'pending' AND action = 'create'
+          WHERE id = @id AND status = 'pending' AND action IN ('create','update')
           RETURNING id'''),
       parameters: {'payload': jsonEncode(body), 'id': draftId},
     );
@@ -616,7 +1000,7 @@ Future<void> main() async {
     }
     final result = await connection.execute(
       Sql.named('''UPDATE product_drafts SET status = 'discarded'
-          WHERE id = @id AND status = 'pending' AND action = 'create'
+          WHERE id = @id AND status = 'pending' AND action IN ('create','update')
           RETURNING id'''),
       parameters: {'id': draftId},
     );
@@ -642,7 +1026,7 @@ Future<void> main() async {
       }
     }
     final adminOnly = path.startsWith('drafts') || path == 'users' || path.startsWith('admin/') ||
-        path.startsWith('terminals/') || path == 'publish';
+        path.startsWith('terminals/') || path.startsWith('inventory') || path.startsWith('suppliers') || path == 'publish' || (path.startsWith('products/') && path.endsWith('/draft'));
     if (adminOnly && session.role != 'admin') return jsonResponse({'error':'Admin only'},status:403);
     return router.call(request);
   }
