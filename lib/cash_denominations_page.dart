@@ -1,8 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'report_printing.dart';
 import 'z_reading_page.dart';
 import 'ionyk_api.dart';
+import 'dev_cash_report.dart';
 
 class CashDenominationsPage extends StatefulWidget {
   const CashDenominationsPage({super.key});
@@ -15,6 +15,19 @@ class _CashDenominationsPageState extends State<CashDenominationsPage> {
   final controllers = <double, TextEditingController>{for (final d in denominations) d: TextEditingController()};
   bool printing = false;
   bool savingCount = false;
+  bool endingSession = false;
+  late Future<Map<String,dynamic>> activeSession;
+
+  @override
+  void initState() {
+    super.initState();
+    activeSession=const IonykApi().cashSession();
+  }
+  void refreshSession(){
+    final next=const IonykApi().cashSession();
+    if(mounted) setState(()=>activeSession=next);
+  }
+
   static const ink = Color(0xFF171B1C);
   static const muted = Color(0xFF687272);
   static const canvas = Color(0xFFF3F4F1);
@@ -35,7 +48,14 @@ class _CashDenominationsPageState extends State<CashDenominationsPage> {
   Future<void> printCashCount() async {
     setState(() => printing = true);
     try {
-      await ReportPrinting.printDenominations(date: DateTime.now(), counts: counts);
+      final info=await const IonykApi().cashSession();
+      final values=await const IonykApi().receiptSettings();
+      await DevCashReport.printDenominations(
+        counts:counts,settings:values,
+        session: info['active']==true
+          ? {...Map<String,dynamic>.from(info['session'] as Map),
+              'terminal_id':IonykApi.currentTerminalId,
+              'cashier':IonykApi.currentDisplayName}:null);
     } catch (e) {
       if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Unable to print: $e')));
     } finally {
@@ -45,15 +65,14 @@ class _CashDenominationsPageState extends State<CashDenominationsPage> {
 
   Future<void> saveTestCount() async {
     if (savingCount) return;
-    if (counts.values.any((n) => n < 0) ||
-        counts.values.every((n) => n == 0)) {
+    if (counts.values.any((n) => n < 0)) {
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-        content: Text('Enter your denomination counts before saving a test reconciliation.')));
+        content: Text('Check the entered denominations before saving.')));
       return;
     }
     final ok = await showDialog<bool>(context: context, builder: (ctx) => AlertDialog(
       title: const Text('Save test cash count?'),
-      content: Text('Counted cash: ${amount(total)}\nThis updates today’s DEVELOPMENT count for your counter. It does not close a fiscal day.'),
+      content: Text('Counted cash: ${amount(total)}\nThis saves a DEVELOPMENT count for the current cashier session. Expected cash includes opening float and recorded cash sales. It does not close a fiscal day.'),
       actions: [
         TextButton(onPressed: ()=>Navigator.pop(ctx,false),child:const Text('Cancel')),
         FilledButton(onPressed: ()=>Navigator.pop(ctx,true),child:const Text('Save test count')),
@@ -65,6 +84,7 @@ class _CashDenominationsPageState extends State<CashDenominationsPage> {
       final sent = <String,int>{for (final d in denominations)
         d.toStringAsFixed(2): counts[d]!};
       final result = await const IonykApi().saveTestCashCount(sent);
+      refreshSession();
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content:Text(
         'Saved test count. Expected ${amount((num.tryParse('${result['expected_cash']}')??0).toDouble())}; '
@@ -74,6 +94,54 @@ class _CashDenominationsPageState extends State<CashDenominationsPage> {
         content:Text('Unable to save test count: $e')));
     } finally {if (mounted) setState(()=>savingCount=false);}
   }
+
+  Future<void> endTestSession() async {
+    if(endingSession) return;
+    final ok=await showDialog<bool>(context:context,builder:(ctx)=>AlertDialog(
+      title:const Text('End development cashier session?'),
+      content:const Text('Save your final denomination count first. Ending the session stops new sales under this session and preserves the closing report.'),
+      actions:[TextButton(onPressed:()=>Navigator.pop(ctx,false),child:const Text('Cancel')),
+        FilledButton(onPressed:()=>Navigator.pop(ctx,true),child:const Text('End test session'))],
+    ));
+    if(ok!=true || !mounted) return;
+    setState(()=>endingSession=true);
+    try {
+      await const IonykApi().closeCashSession();
+      refreshSession();
+      if(mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content:Text('Test session closed. Next cashier login must start a new session.')));
+    } catch(e) {if(mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content:Text('Could not close session: $e')));}
+    finally {if(mounted) setState(()=>endingSession=false);}
+  }
+
+  Widget sessionSummary() => FutureBuilder<Map<String,dynamic>>(
+    future:activeSession,builder:(ctx,snap){
+      if(snap.hasError) return Text('Session error: ${snap.error}',
+        style:const TextStyle(fontSize:11,color:Colors.red));
+      if(!snap.hasData) return const LinearProgressIndicator();
+      final data=snap.data!;
+      if(data['active']!=true) return const Text('No open cashier session. Start one from Point of Sale.',
+        style:TextStyle(fontSize:12,color:muted));
+      final v=Map<String,dynamic>.from(data['session'] as Map);
+      double number(String k)=>(num.tryParse('${v[k]??0}')??0).toDouble();
+      Widget detail(String k,String value)=>Padding(padding:const EdgeInsets.symmetric(vertical:3),
+        child:Row(children:[Expanded(child:Text(k,style:const TextStyle(fontSize:11))),
+          Text(value,style:const TextStyle(fontSize:12,fontWeight:FontWeight.w700))]));
+      return Column(children:[
+        detail('Opening cash',amount(number('opening_cash'))),
+        detail('Session cash sales',amount(number('session_cash_sales'))),
+        const Divider(height:14),
+        detail('Expected / accountability',amount(number('expected_cash'))),
+        detail('Counted denominations',amount(total)),
+        detail('Short / over',amount(total-number('expected_cash'))),
+        const SizedBox(height:8),
+        SizedBox(width:double.infinity,child:OutlinedButton.icon(
+          onPressed:endingSession?null:endTestSession,
+          icon:const Icon(Icons.lock_clock_outlined,size:17),
+          label:Text(endingSession?'Ending session…':'End test session after saving count'))),
+      ]);
+    });
 
   Widget panel(Widget child) => Container(
     padding: const EdgeInsets.all(22),
@@ -147,7 +215,9 @@ class _CashDenominationsPageState extends State<CashDenominationsPage> {
           ),
         ),
       ),
-      const SizedBox(height: 14),
+      const SizedBox(height: 10),
+      sessionSummary(),
+      const SizedBox(height: 10),
       Container(
         padding: const EdgeInsets.all(15),
         decoration: BoxDecoration(
@@ -190,7 +260,7 @@ class _CashDenominationsPageState extends State<CashDenominationsPage> {
   Widget build(BuildContext context) => Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
     LayoutBuilder(
       builder: (context, constraints) {
-        const panelHeight = 680.0;
+        const panelHeight = 770.0;
         final sideBySide = constraints.maxWidth >= 920;
         final cashCard = SizedBox(
           height: panelHeight,

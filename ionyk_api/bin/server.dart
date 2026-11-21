@@ -357,6 +357,137 @@ Future<void> main() async {
     } catch (e) { return jsonResponse({'error':'Publishing failed. No changes committed: $e'},status:400); }
   });
 
+  // Phase 17: per-counter TEST sessions with an opening cash float.
+  // The DB contains no backfilled opening cash for historic test receipts.
+  Future<Map<String,dynamic>?> activeCashSession(int counter) async {
+    final rows=await connection.execute(Sql.named('''SELECT sh.id,sh.cashier_user_id,
+      sh.opening_cash,sh.opened_at,COALESCE(SUM(sa.total),0),COUNT(sa.id),
+      COALESCE(SUM(sa.item_count),0)
+      FROM dev_cashier_sessions sh LEFT JOIN dev_test_sales sa
+        ON sa.cashier_session_id=sh.id
+      WHERE sh.terminal_id=@counter AND sh.closed_at IS NULL
+      GROUP BY sh.id ORDER BY sh.id DESC LIMIT 1'''), parameters:{'counter':counter});
+    if(rows.isEmpty) return null;
+    final r=rows.first;
+    final opening=num.parse('${r[2]}').toDouble();
+    final sales=num.parse('${r[4]}').toDouble();
+    return {'id':r[0], 'cashier_user_id':r[1],
+      'opening_cash':opening,'opened_at':'${r[3]}',
+      'session_cash_sales':sales,'expected_cash':opening+sales,
+      'transaction_count':(r[5] as num).toInt(),
+      'items_sold':(r[6] as num).toInt(), 'test_only':true};
+  }
+
+  router.get('/cash/session', (Request request) async {
+    final user=sessionFor(request);
+    if(user==null || user.role!='cashier' || user.terminalId==null)
+      return jsonResponse({'error':'Cashier login required'},status:403);
+    final data=await activeCashSession(user.terminalId!);
+    if(data==null) return jsonResponse({'active':false,'session':null});
+    if(data['cashier_user_id']!=user.userId)
+      return jsonResponse({'error':'Another cashier has an open session for this counter. Ask Admin to resolve.'},status:409);
+    return jsonResponse({'active':true,'session':data});
+  });
+
+  router.post('/cash/session/start', (Request request) async {
+    final user=sessionFor(request);
+    if(user==null || user.role!='cashier' || user.terminalId==null)
+      return jsonResponse({'error':'Cashier login required'},status:403);
+    Map<String,dynamic> body;
+    try {body=Map<String,dynamic>.from(jsonDecode(await request.readAsString()) as Map);}
+    catch (_) {return jsonResponse({'error':'Invalid JSON'},status:400);}
+    final amount=num.tryParse('${body['opening_cash']}');
+    if(amount==null || !amount.isFinite || amount<0 || amount>100000000 ||
+       (amount*100-(amount*100).round()).abs()>0.00001)
+      return jsonResponse({'error':'Opening cash must be a valid nonnegative amount with up to two decimals'},status:400);
+    try {
+      final result=await connection.execute(Sql.named('''INSERT INTO dev_cashier_sessions
+        (terminal_id,cashier_user_id,opening_cash)
+        VALUES (@counter,@cashier,@opening) RETURNING id'''),parameters:{
+          'counter':user.terminalId,'cashier':user.userId,'opening':amount});
+      return jsonResponse({'ok':true,'id':result.first[0],
+        'opening_cash':amount,'test_only':true},status:201);
+    } catch (_) {return jsonResponse({'error':'This counter already has an open test session. Close it before starting another.'},status:409);}
+  });
+
+  router.post('/cash/session/close', (Request request) async {
+    final user=sessionFor(request);
+    if(user==null || user.role!='cashier' || user.terminalId==null)
+      return jsonResponse({'error':'Cashier login required'},status:403);
+    try {
+      final result=await connection.runTx((tx) async {
+        final shifts=await tx.execute(Sql.named('''SELECT id FROM dev_cashier_sessions
+           WHERE terminal_id=@counter AND cashier_user_id=@cashier
+           AND closed_at IS NULL FOR UPDATE'''),parameters:{
+          'counter':user.terminalId,'cashier':user.userId});
+        if(shifts.isEmpty) throw StateError('No open cashier session');
+        final id=shifts.first[0] as int;
+        final count=await tx.execute(Sql.named('''SELECT id,updated_at FROM dev_test_cash_counts
+            WHERE cashier_session_id=@id FOR UPDATE'''),parameters:{'id':id});
+        if(count.isEmpty) throw StateError('Save a denomination count before ending your session');
+        final lastSale=await tx.execute(Sql.named('''SELECT MAX(created_at) FROM dev_test_sales
+            WHERE cashier_session_id=@id'''),parameters:{'id':id});
+        final stamp=lastSale.first[0] as DateTime?;
+        if(stamp!=null && (count.first[1] as DateTime).isBefore(stamp))
+          throw StateError('New sales were recorded after the last count. Save an updated cash count.');
+        await tx.execute(Sql.named('''UPDATE dev_cashier_sessions SET closed_at=now()
+            WHERE id=@id'''),parameters:{'id':id});
+        return id;
+      });
+      return jsonResponse({'ok':true,'closed_session_id':result,'test_only':true});
+    } catch(e) {return jsonResponse({'error':'Cannot close test session: $e'},status:400);}
+  });
+
+  router.get('/cash/session/history', (Request request) async {
+    final user=sessionFor(request);
+    if(user==null || user.role!='cashier' || user.terminalId==null)
+      return jsonResponse({'error':'Cashier login required'},status:403);
+    final rows=await connection.execute(Sql.named('''SELECT sh.id,sh.opened_at,sh.closed_at,sh.opening_cash,
+      COALESCE((SELECT SUM(sa.total) FROM dev_test_sales sa
+        WHERE sa.cashier_session_id=sh.id),0),
+      c.counted_cash,c.variance,c.denominations,
+      COALESCE((SELECT COUNT(*) FROM dev_test_sales sa
+        WHERE sa.cashier_session_id=sh.id),0),
+      COALESCE((SELECT SUM(sa.item_count) FROM dev_test_sales sa
+        WHERE sa.cashier_session_id=sh.id),0)
+      FROM dev_cashier_sessions sh
+      LEFT JOIN dev_test_cash_counts c ON c.cashier_session_id=sh.id
+      WHERE sh.terminal_id=@counter AND sh.cashier_user_id=@cashier
+      ORDER BY sh.opened_at DESC LIMIT 200'''),parameters:{
+         'counter':user.terminalId,'cashier':user.userId});
+    return jsonResponse([for(final r in rows){
+      'id':r[0],'opened_at':'${r[1]}','closed_at':r[2]?.toString(),
+      'opening_cash':num.parse('${r[3]}'),'cash_sales':num.parse('${r[4]}'),
+      'expected_cash':num.parse('${r[3]}')+num.parse('${r[4]}'),
+      'counted_cash':r[5]==null?null:num.parse('${r[5]}'),
+      'variance':r[6]==null?null:num.parse('${r[6]}'),
+      'denominations':r[7], 'transaction_count':r[8],'items_sold':r[9],
+      'test_only':true
+    }]);
+  });
+
+  // Receipt header settings are development-only and stored centrally.
+  router.get('/receipt/settings', (Request request) async {
+    if(sessionFor(request)==null) return jsonResponse({'error':'Login required'},status:403);
+    final rows=await connection.execute('SELECT settings FROM dev_receipt_layout_settings WHERE singleton_id=1');
+    return jsonResponse(rows.isEmpty?{}:rows.first[0]);
+  });
+  router.put('/receipt/settings', (Request request) async {
+    if(sessionFor(request)?.role!='admin') return jsonResponse({'error':'Admin required'},status:403);
+    Map<String,dynamic> values;
+    try {values=Map<String,dynamic>.from(jsonDecode(await request.readAsString()) as Map);}
+    catch (_) {return jsonResponse({'error':'Invalid JSON'},status:400);}
+    const allowed=['business','owner','address','tin','min','ptu','machine','footer'];
+    if(values.keys.any((k)=>!allowed.contains(k)) ||
+      values.values.any((v)=>v is! String || (v as String).length>400))
+      return jsonResponse({'error':'Invalid receipt layout settings'},status:400);
+    await connection.execute(Sql.named('''INSERT INTO dev_receipt_layout_settings(singleton_id,settings)
+      VALUES (1,CAST(@settings AS jsonb)) ON CONFLICT(singleton_id)
+      DO UPDATE SET settings=EXCLUDED.settings,updated_at=now()'''),
+      parameters:{'settings':jsonEncode(values)});
+    return jsonResponse({'ok':true});
+  });
+
   // Demo-mode sale recording. Never a BIR invoice; cannot reduce stock.
   // Server gets prices from published product_prices (client totals are not trusted).
   router.post('/sales/test', (Request request) async {
@@ -384,6 +515,12 @@ Future<void> main() async {
     double money(double v)=>double.parse(v.toStringAsFixed(2));
     try {
       final data=await connection.runTx((tx) async {
+        final shifts=await tx.execute(Sql.named('''SELECT id FROM dev_cashier_sessions
+          WHERE terminal_id=@counter AND cashier_user_id=@cashier
+          AND closed_at IS NULL FOR UPDATE'''), parameters:{
+          'counter':session.terminalId,'cashier':session.userId});
+        if(shifts.isEmpty) throw StateError('Start a cashier session and enter opening cash before checkout');
+        final shiftId=shifts.first[0] as int;
         final lines=<({int? id,String unit,String? description,int qty,double price,double total})>[];
         var subtotal=0.0;var count=0;
         for (final raw in items) {
@@ -442,10 +579,10 @@ Future<void> main() async {
           RETURNING next_number-1'''),parameters:{'counter':session.terminalId});
         final receiptNo = (seq.first[0] as num).toInt();
         final sale=await tx.execute(Sql.named('''INSERT INTO dev_test_sales
-          (terminal_id,cashier_user_id,receipt_no,total,tendered,change_due,item_count)
-          VALUES (@counter,@cashier,@receipt_no,@total,@cash,@change,@count) RETURNING id'''),
+          (terminal_id,cashier_user_id,receipt_no,total,tendered,change_due,item_count,cashier_session_id)
+          VALUES (@counter,@cashier,@receipt_no,@total,@cash,@change,@count,@shift) RETURNING id'''),
           parameters:{'counter':session.terminalId,'cashier':session.userId,
-            'receipt_no':receiptNo,'total':total,'cash':tendered,'change':change,'count':count});
+            'receipt_no':receiptNo,'total':total,'cash':tendered,'change':change,'count':count,'shift':shiftId});
         final saleId=sale.first[0] as int;
         for (final line in lines) {
           await tx.execute(Sql.named('''INSERT INTO dev_test_sale_lines
@@ -463,87 +600,88 @@ Future<void> main() async {
     } catch (e) { return jsonResponse({'error':'Test sale not recorded: $e'},status:400); }
   });
 
-  // Development-only cash counts. These do NOT close any fiscal day.
-  // Expected cash is only the total of saved cash test-sales for this counter
-  // on the Philippine-local date; opening float, cash-in/out, refunds and
-  // other payment types are not modeled. An existing daily count is replaced
-  // explicitly in the development ledger (not an audit-safe production rule).
+  // Per-session development counts: expected = opening float + session cash sales.
+  // No cash-out, refunds, transfers or fiscal closing in this build.
   router.post('/cash/test-count', (Request request) async {
-    final session = sessionFor(request);
-    if (session == null || session.role != 'cashier' || session.terminalId == null) {
+    final user=sessionFor(request);
+    if(user==null || user.role!='cashier' || user.terminalId==null)
       return jsonResponse({'error':'Cashier login required'},status:403);
-    }
     Map<String,dynamic> body;
     try {body=Map<String,dynamic>.from(jsonDecode(await request.readAsString()) as Map);}
     catch (_) {return jsonResponse({'error':'Invalid JSON'},status:400);}
-    if (body['denominations'] is! Map) {
+    if(body['denominations'] is! Map)
       return jsonResponse({'error':'Denomination counts required'},status:400);
-    }
-    const values = <String,int>{'1000.00':100000,'500.00':50000,'200.00':20000,
+    const values=<String,int>{'1000.00':100000,'500.00':50000,'200.00':20000,
       '100.00':10000,'50.00':5000,'20.00':2000,'10.00':1000,'5.00':500,
       '1.00':100,'0.25':25};
     final entered=Map<String,dynamic>.from(body['denominations'] as Map);
-    if (entered.keys.any((key)=>!values.containsKey(key))) {
+    if(entered.keys.any((key)=>!values.containsKey(key)))
       return jsonResponse({'error':'Unknown denomination'},status:400);
-    }
     var cents=0;
-    for (final key in values.keys) {
+    for(final key in values.keys){
       final raw=entered[key]??0;
-      if (raw is! int || raw<0 || raw>100000) {
+      if(raw is! int || raw<0 || raw>100000)
         return jsonResponse({'error':'Invalid count for $key'},status:400);
-      }
-      cents += raw*values[key]!;
+      cents+=raw*values[key]!;
     }
-    if (cents==0 || cents>100000000000) {
-      return jsonResponse({'error':'Enter a nonzero cash count within the test limit'},status:400);
-    }
-    final result = await connection.runTx((tx) async {
-      final sales=await tx.execute(Sql.named('''SELECT COALESCE(SUM(total),0)
-        FROM dev_test_sales WHERE terminal_id=@counter
-        AND (created_at AT TIME ZONE 'Asia/Manila')::date=(now() AT TIME ZONE 'Asia/Manila')::date'''),
-        parameters:{'counter':session.terminalId});
-      final expected = num.parse('${sales.first[0]}');
-      final counted = cents/100;
-      final variance = double.parse((counted-expected).toStringAsFixed(2));
-      final saved=await tx.execute(Sql.named('''INSERT INTO dev_test_cash_counts
-        (terminal_id,cashier_user_id,business_day,denominations,
-         expected_cash,counted_cash,variance)
-        VALUES (@counter,@cashier,(now() AT TIME ZONE 'Asia/Manila')::date,
-          CAST(@denoms AS jsonb),@expected,@counted,@variance)
-        ON CONFLICT(terminal_id,business_day) DO UPDATE SET
-          cashier_user_id=EXCLUDED.cashier_user_id,
-          denominations=EXCLUDED.denominations,
-          expected_cash=EXCLUDED.expected_cash,
-          counted_cash=EXCLUDED.counted_cash,
-          variance=EXCLUDED.variance,
-          updated_at=now() RETURNING id,business_day'''),parameters:{
-          'counter':session.terminalId,'cashier':session.userId,
-          'denoms':jsonEncode(entered),'expected':expected,
-          'counted':counted,'variance':variance});
-      return {'id':saved.first[0],'terminal_id':session.terminalId,
-        'business_day':'${saved.first[1]}','expected_cash':expected,
-        'counted_cash':counted,'variance':variance,'test_only':true};
-    });
-    return jsonResponse(result,status:201);
+    if(cents>100000000000)
+      return jsonResponse({'error':'Cash count exceeds the development limit'},status:400);
+    try {
+      final result=await connection.runTx((tx) async {
+        final shifts=await tx.execute(Sql.named('''SELECT id,opening_cash
+          FROM dev_cashier_sessions WHERE terminal_id=@counter AND cashier_user_id=@cashier
+          AND closed_at IS NULL FOR UPDATE'''),parameters:{
+            'counter':user.terminalId,'cashier':user.userId});
+        if(shifts.isEmpty) throw StateError('Open a cashier session before counting');
+        final id=shifts.first[0] as int;
+        final opening=num.parse('${shifts.first[1]}');
+        final sales=await tx.execute(Sql.named('''SELECT COALESCE(SUM(total),0)
+          FROM dev_test_sales WHERE cashier_session_id=@id'''),parameters:{'id':id});
+        final cashSales=num.parse('${sales.first[0]}');
+        final expected=opening+cashSales;
+        final counted=cents/100;
+        final variance=double.parse((counted-expected).toStringAsFixed(2));
+        final saved=await tx.execute(Sql.named('''INSERT INTO dev_test_cash_counts
+          (terminal_id,cashier_user_id,business_day,denominations,expected_cash,
+           counted_cash,variance,cashier_session_id,opening_cash,session_sales_cash)
+          VALUES (@counter,@cashier,(now() AT TIME ZONE 'Asia/Manila')::date,
+            CAST(@denoms AS jsonb),@expected,@counted,@variance,@shift,@opening,@sales)
+          ON CONFLICT(cashier_session_id) DO UPDATE SET
+           denominations=EXCLUDED.denominations,expected_cash=EXCLUDED.expected_cash,
+           counted_cash=EXCLUDED.counted_cash,variance=EXCLUDED.variance,
+           opening_cash=EXCLUDED.opening_cash,session_sales_cash=EXCLUDED.session_sales_cash,
+           updated_at=now() RETURNING id,business_day'''),parameters:{
+            'counter':user.terminalId,'cashier':user.userId,
+            'denoms':jsonEncode(entered),'expected':expected,'counted':counted,
+            'variance':variance,'shift':id,'opening':opening,'sales':cashSales});
+        return {'id':saved.first[0],'session_id':id,'terminal_id':user.terminalId,
+          'business_day':'${saved.first[1]}','opening_cash':opening,
+          'session_cash_sales':cashSales,'expected_cash':expected,
+          'counted_cash':counted,'variance':variance,'test_only':true};
+      });
+      return jsonResponse(result,status:201);
+    } catch(e) {return jsonResponse({'error':'Could not save test count: $e'},status:400);}
   });
 
   router.get('/cash/test-reconciliations', (Request request) async {
-    if (sessionFor(request)?.role!='admin') {
+    if(sessionFor(request)?.role!='admin')
       return jsonResponse({'error':'Admin required'},status:403);
-    }
     final rows=await connection.execute('''SELECT c.id,c.terminal_id,c.business_day,
-      c.expected_cash,c.counted_cash,c.variance,
-      t.label,u.display_name
+      c.expected_cash,c.counted_cash,c.variance,t.label,u.display_name,
+      c.opening_cash,c.session_sales_cash,c.cashier_session_id,sh.opened_at,sh.closed_at
       FROM dev_test_cash_counts c
       JOIN terminals t ON t.id=c.terminal_id
       LEFT JOIN app_users u ON u.id=c.cashier_user_id
-      ORDER BY c.business_day DESC,c.terminal_id''');
-    return jsonResponse([for (final r in rows){
-      'id':r[0],'terminal_id':r[1], 'business_day':'${r[2]}',
-      'expected_cash':num.parse('${r[3]}'),
-      'counted_cash':num.parse('${r[4]}'),
-      'variance':num.parse('${r[5]}'),
-      'counter_label':r[6], 'cashier_name':r[7],
+      LEFT JOIN dev_cashier_sessions sh ON sh.id=c.cashier_session_id
+      ORDER BY c.business_day DESC,c.terminal_id,c.id DESC''');
+    return jsonResponse([for(final r in rows){
+      'id':r[0],'terminal_id':r[1],'business_day':'${r[2]}',
+      'expected_cash':num.parse('${r[3]}'),'counted_cash':num.parse('${r[4]}'),
+      'variance':num.parse('${r[5]}'),'counter_label':r[6],
+      'cashier_name':r[7],'opening_cash':num.parse('${r[8]}'),
+      'session_cash_sales':num.parse('${r[9]}'),
+      'session_id':r[10], 'opened_at':r[11]?.toString(),
+      'closed_at':r[12]?.toString(),'legacy':r[10]==null,
     }]);
   });
 

@@ -5,6 +5,7 @@ import 'ionyk_api.dart';
 import 'inventory_management.dart';
 import 'suppliers_management.dart';
 import 'ionyk_admin_table.dart';
+import 'receipt_layout_settings.dart';
 
 const _ink = Color(0xFF171B1C);
 const _muted = Color(0xFF6D7772);
@@ -317,10 +318,14 @@ class _AdminWorkspacePageState extends State<AdminWorkspacePage> {
         (num.tryParse('${r['expected_cash']}') ?? 0).toDouble());
       final counted = records.fold<double>(0, (n,r) => n +
         (num.tryParse('${r['counted_cash']}') ?? 0).toDouble());
+      final opening = records.fold<double>(0,(n,r)=>n+
+        (num.tryParse('${r['opening_cash']}')??0).toDouble());
+      final sales = records.fold<double>(0,(n,r)=>n+
+        (num.tryParse('${r['session_cash_sales']}')??0).toDouble());
       String fmt(double n) => '₱${n.toStringAsFixed(2)}';
       return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         sectionTitle('Cash reconciliation',
-          'Development counts only · expected assumes zero opening cash and no cash movements',
+          'Development sessions · expected includes opening float and saved test cash sales',
           trailing: button('Refresh', Icons.refresh_rounded,
             action: ()=>setState(() {}))),
         const SizedBox(height: 18),
@@ -329,27 +334,33 @@ class _AdminWorkspacePageState extends State<AdminWorkspacePage> {
             style:const TextStyle(color:Colors.red))),
         metrics([
           ('Expected cash', snapshot.hasData?fmt(expected):'--',
-            'Based on test cash sales',Icons.account_balance_wallet_outlined),
+            'Opening float + session cash sales',Icons.account_balance_wallet_outlined),
           ('Counted cash', snapshot.hasData?fmt(counted):'--',
             'Saved denomination counts',Icons.payments_outlined),
           ('Cash variance', snapshot.hasData?fmt(counted-expected):'--',
             'Counted minus expected',Icons.balance_outlined),
           ('Recorded test counts',snapshot.hasData?'${records.length}':'--',
-            'Counter-day records',Icons.pending_actions_outlined),
+            'Counter-session counts',Icons.pending_actions_outlined),
+          ('Opening cash',snapshot.hasData?fmt(opening):'--',
+            'Starting drawer amounts',Icons.money_outlined),
+          ('Session cash sales',snapshot.hasData?fmt(sales):'--',
+            'Development cash transactions',Icons.receipt_long_outlined),
         ]),
         card(Column(crossAxisAlignment:CrossAxisAlignment.stretch, children: [
           const Text('Counter reconciliation',
             style:TextStyle(fontSize:14,fontWeight:FontWeight.w700)),
           const SizedBox(height:5),
-          const Text('Each row is a saved development count for one counter and date.',
+          const Text('Each row is one saved count for a test cashier session (older rows are marked legacy).' ,
             style:TextStyle(fontSize:11,color:_muted)),
           const SizedBox(height:15),
           IonykAdminTable(
-            columns:const ['Date','Counter / Cashier','Expected','Counted','Variance'],
+            columns:const ['Date','Counter / Cashier','Opening','Cash sales','Expected','Counted','Variance'],
             emptyMessage:'No saved test counts yet. Sign in as a cashier and save a count under Cash Closing.',
             rows:[for (final r in records) [
               readableBusinessDay(r['business_day']),
-              '${r['counter_label'] ?? r['terminal_id']} · ${r['cashier_name'] ?? '--'}',
+              '${r['counter_label'] ?? r['terminal_id']} · ${r['cashier_name'] ?? '--'}${r['legacy']==true?' (legacy)':''}',
+              fmt((num.tryParse('${r['opening_cash']}')??0).toDouble()),
+              fmt((num.tryParse('${r['session_cash_sales']}')??0).toDouble()),
               fmt((num.tryParse('${r['expected_cash']}')??0).toDouble()),
               fmt((num.tryParse('${r['counted_cash']}')??0).toDouble()),
               fmt((num.tryParse('${r['variance']}')??0).toDouble()),
@@ -471,6 +482,8 @@ class _AdminWorkspacePageState extends State<AdminWorkspacePage> {
     sectionTitle('Settings','Personalize the IONYK workspace and configure the store.',trailing:Container(padding:const EdgeInsets.symmetric(horizontal:11,vertical:8),decoration:BoxDecoration(borderRadius:BorderRadius.circular(10),color:IonykBrand.instance.accent),child:const Text('LOCAL APPEARANCE',style:TextStyle(fontSize:10,fontWeight:FontWeight.w700)))),
     const SizedBox(height:18),
     const CounterManagementPanel(),
+    const SizedBox(height:14),
+    const ReceiptLayoutSettings(),
     const SizedBox(height:14),
     LayoutBuilder(builder:(context,c){
       final left=card(Column(crossAxisAlignment:CrossAxisAlignment.start,children:[

@@ -115,6 +115,23 @@ class IonykApi {
         'name':name,'phone':phone,
       }));
 
+  /// Development cashier session and opening drawer float.
+  Future<Map<String,dynamic>> cashSession() async =>
+      Map<String,dynamic>.from(await _request('GET','/cash/session'));
+  Future<Map<String,dynamic>> startCashSession(double opening) async =>
+      Map<String,dynamic>.from(await _request('POST','/cash/session/start',
+        {'opening_cash':opening}));
+  Future<Map<String,dynamic>> closeCashSession() async =>
+      Map<String,dynamic>.from(await _request('POST','/cash/session/close',{}));
+  Future<List<Map<String,dynamic>>> cashSessionHistory() async =>
+      (await _request('GET','/cash/session/history') as List)
+        .map((e)=>Map<String,dynamic>.from(e as Map)).toList();
+  Future<Map<String,dynamic>> receiptSettings() async =>
+      Map<String,dynamic>.from(await _request('GET','/receipt/settings'));
+  Future<void> saveReceiptSettings(Map<String,String> data) async {
+    await _request('PUT','/receipt/settings',data);
+  }
+
   /// DEVELOPMENT cash count: only a signed-in cashier can save their counter.
   /// The backend calculates expected money from test cash receipts, not Flutter.
   Future<Map<String,dynamic>> saveTestCashCount(Map<String,int> denominations) async =>

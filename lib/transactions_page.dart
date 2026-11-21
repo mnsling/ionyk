@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'ionyk_api.dart';
 import 'ionyk_date_filter.dart';
+import 'dev_cash_report.dart';
 
 /// Development-test transactions from PostgreSQL, not official fiscal invoices.
 class TransactionsPage extends StatefulWidget {
@@ -20,11 +21,27 @@ class _TransactionsPageState extends State<TransactionsPage> {
   Map<String, dynamic>? selectedReceipt;
   int? selectedId;
   bool receiptLoading = false;
+  bool printingReceipt = false;
+  late Future<Map<String,dynamic>> businessHeader;
+  Future<void> printSelectedReceipt() async {
+    final receipt=selectedReceipt;
+    if(receipt==null || printingReceipt) return;
+    setState(()=>printingReceipt=true);
+    try {
+      final settings=await api.receiptSettings();
+      await DevCashReport.printSale(receipt:receipt,settings:settings);
+    } catch(e) {
+      if(mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content:Text('Unable to print development receipt: $e')));
+    } finally {if(mounted)setState(()=>printingReceipt=false);}
+  }
+
 
   @override
   void initState() {
     super.initState();
     history = api.testTransactions();
+    businessHeader=api.receiptSettings();
   }
 
   void refresh() {
@@ -95,8 +112,10 @@ class _TransactionsPageState extends State<TransactionsPage> {
     return SingleChildScrollView(padding: const EdgeInsets.all(22), child: Center(
       child: ConstrainedBox(constraints: const BoxConstraints(maxWidth: 410), child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-          const Center(child: Text('IONYK SYSTEMS', style: TextStyle(
-              fontSize: 18, fontWeight: FontWeight.w800, letterSpacing: .5))),
+          FutureBuilder<Map<String,dynamic>>(future:businessHeader,
+            builder:(ctx,snap)=>Center(child:Text(
+              '${snap.data?['business']??'IONYK SYSTEMS'}',
+              style:const TextStyle(fontSize:18,fontWeight:FontWeight.w800)))),
           const SizedBox(height: 5),
           const Center(child: Text('DEVELOPMENT TEST RECEIPT', style: TextStyle(
               color: muted, fontSize: 10, letterSpacing: .6))),
@@ -212,9 +231,14 @@ class _TransactionsPageState extends State<TransactionsPage> {
         })),
       ]));
       final right = frame(Column(children: [
-        const Padding(padding: EdgeInsets.all(17), child: Row(children: [
-          Icon(Icons.receipt_long_outlined, size: 18), SizedBox(width: 9),
-          Text('Receipt preview', style: TextStyle(fontWeight: FontWeight.w700)),
+        Padding(padding:const EdgeInsets.all(15),child:Row(children:[
+          const Icon(Icons.receipt_long_outlined,size:18),
+          const SizedBox(width:9),
+          const Expanded(child:Text('Receipt preview',
+            style:TextStyle(fontWeight:FontWeight.w700))),
+          TextButton.icon(onPressed:selectedReceipt==null||printingReceipt?null:printSelectedReceipt,
+            icon:const Icon(Icons.print_outlined,size:16),
+            label:const Text('Print TEST')),
         ])),
         const Divider(height: 1),
         Expanded(child: receiptPanel()),

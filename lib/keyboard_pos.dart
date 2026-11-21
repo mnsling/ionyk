@@ -49,6 +49,83 @@ class _KeyboardPosState extends State<KeyboardPos> {
   bool _dialogOpen = false;
   ModalRoute<dynamic>? _posRoute;
 
+  Map<String,dynamic>? _activeCashSession;
+  bool _loadingCashSession=true;
+  bool _startingCashSession=false;
+
+  Future<void> _refreshCashSession() async {
+    try {
+      final result=await _api.cashSession();
+      if (!mounted) return;
+      setState(() {
+        _activeCashSession=result['active']==true
+          ? Map<String,dynamic>.from(result['session'] as Map) : null;
+        _loadingCashSession=false;
+      });
+    } catch(e) {
+      if (!mounted) return;
+      setState(()=>_loadingCashSession=false);
+      _notice('Could not load cashier session: $e');
+    }
+  }
+
+  Future<void> _startCashSession() async {
+    if(_startingCashSession) return;
+    final controller=TextEditingController();
+    final opening=await _openPosDialog<double>((ctx)=>IonykModal(
+      title:const Text('Start cashier session'),
+      content:SizedBox(width:390,child:Column(mainAxisSize:MainAxisSize.min,
+        crossAxisAlignment:CrossAxisAlignment.start,children:[
+        const Text('Enter the opening cash already in your drawer. This money is not a sale.'),
+        const SizedBox(height:14),
+        TextField(controller:controller,autofocus:true,
+          keyboardType:const TextInputType.numberWithOptions(decimal:true),
+          inputFormatters:[FilteringTextInputFormatter.allow(RegExp(r'[0-9.]'))],
+          decoration:const InputDecoration(labelText:'Opening cash (PHP)',hintText:'0.00'),
+          onSubmitted:(_){final n=double.tryParse(controller.text);if(n!=null&&n>=0)Navigator.pop(ctx,n);}),
+        const SizedBox(height:7),
+        const Text('Development session only. No official fiscal day is opened.',
+          style:TextStyle(fontSize:11,color:Color(0xFF687272))),
+      ])),
+      actions:[TextButton(onPressed:()=>Navigator.pop(ctx),child:const Text('Cancel')),
+        FilledButton(onPressed:(){final n=double.tryParse(controller.text);
+          if(n!=null&&n>=0&&n.isFinite)Navigator.pop(ctx,n);},child:const Text('Start session'))],
+    ));
+    controller.dispose();
+    if(!mounted || opening==null) return;
+    setState(()=>_startingCashSession=true);
+    try {
+      await _api.startCashSession(opening);
+      await _refreshCashSession();
+      if(mounted) _notice('Cashier session started. Opening cash: ${_money(opening)}');
+    } catch(e) {if(mounted) _notice('Could not start session: $e');}
+    finally {if(mounted) setState(()=>_startingCashSession=false);}
+    _focusScan();
+  }
+
+  Widget _sessionBanner() {
+    if(_loadingCashSession) return const Padding(padding:EdgeInsets.only(bottom:12),
+      child:LinearProgressIndicator());
+    final open=_activeCashSession!=null;
+    final opening=(num.tryParse('${_activeCashSession?['opening_cash']??0}')??0).toDouble();
+    return Container(
+      margin:const EdgeInsets.only(bottom:14),
+      padding:const EdgeInsets.symmetric(horizontal:15,vertical:11),
+      decoration:BoxDecoration(color:open?const Color(0xFFEAF2E0):const Color(0xFFFFF2DB),
+        borderRadius:BorderRadius.circular(12)),
+      child:Row(children:[
+        Icon(open?Icons.check_circle_outline:Icons.lock_outline,size:19),
+        const SizedBox(width:10),
+        Expanded(child:Text(open
+          ? 'Session #${_activeCashSession!['id']} · Opening drawer: ${_money(opening)}'
+          : 'Start your cashier session and enter opening cash before accepting payments.',
+          style:const TextStyle(fontSize:12,fontWeight:FontWeight.w600))),
+        OutlinedButton(onPressed:open?_refreshCashSession:_startCashSession,
+          child:Text(open?'Refresh':'Start session')),
+      ]),
+    );
+  }
+
   final _products = <_Product>[]; // Populated only from published PostgreSQL products.
 
   @override
@@ -56,7 +133,7 @@ class _KeyboardPosState extends State<KeyboardPos> {
     super.initState();
     FocusManager.instance.addListener(_restoreScannerFocus);
     HardwareKeyboard.instance.addHandler(_onHardwareKey);
-    WidgetsBinding.instance.addPostFrameCallback((_) { _focusScan(); _loadProducts(); });
+    WidgetsBinding.instance.addPostFrameCallback((_) { _focusScan(); _loadProducts(); _refreshCashSession(); });
   }
 
   @override
@@ -598,6 +675,11 @@ class _KeyboardPosState extends State<KeyboardPos> {
   }
 
   Future<void> _payment() async {
+    if (_activeCashSession==null) {
+      _notice('Start a cashier session and enter opening cash before payment.');
+      await _refreshCashSession();
+      return;
+    }
     if (_lines.isEmpty) { _notice('Scan a product first'); return; }
     final amount=_total;
     final controller=TextEditingController();
@@ -735,6 +817,7 @@ class _KeyboardPosState extends State<KeyboardPos> {
 
   @override
   Widget build(BuildContext context) => Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+    _sessionBanner(),
     _modeSelector(),
     const SizedBox(height: 16),
     LayoutBuilder(builder: (context, c) {
